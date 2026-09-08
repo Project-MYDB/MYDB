@@ -102,16 +102,16 @@ typedef struct {
 
 #define LARGE_WAL_MAX_BATCH_PAGES 256
 
-static int plan_layout(LargeWalWriter *w, const RecRef *recs, uint32_t n,
+static int plan_layout(LargeWalWriter *writer, const RecRef *recs, uint32_t n,
                         RecPlan *plan, uint32_t *out_buf_pages,
                         uint32_t *out_end_seg_page, uint32_t *out_end_write_pos)
 {
     uint32_t buf_page   = 0;
-    uint32_t write_pos  = w->cur_offset;
-    uint32_t seg_page   = w->cur_page_no;
-    uint32_t pages_left = LARGE_WAL_SEGMENT_PAGES_PER_FILE - w->cur_page_no;
-    uint64_t seg_no     = w->pool->slots[w->cur_slot_index].header.segment_no;
-    uint64_t next_seg   = w->pool->next_segment_no;
+    uint32_t write_pos  = writer->cur_offset;
+    uint32_t seg_page   = writer->cur_page_no;
+    uint32_t pages_left = LARGE_WAL_SEGMENT_PAGES_PER_FILE - writer->cur_page_no;
+    uint64_t seg_no     = writer->pool->slots[writer->cur_slot_index].header.segment_no;
+    uint64_t next_seg   = writer->pool->next_segment_no;
 
     for (uint32_t i = 0; i < n; i++) {
         uint32_t need = pages_for(write_pos, recs[i].len);
@@ -163,7 +163,7 @@ static int plan_layout(LargeWalWriter *w, const RecRef *recs, uint32_t n,
  * rather than the single content_lsn the old LargeWalPageHeader had.
  * ------------------------------------------------------------------ */
 
-static void pack_batch(LargeWalWriter *w, const uint8_t *content,
+static void pack_batch(LargeWalWriter *writer, const uint8_t *content,
                         const RecRef *recs, const RecPlan *plan, uint32_t n,
                         uint32_t buf_pages, LargeWalIndexEntry *out_entries)
 {
@@ -172,14 +172,14 @@ static void pack_batch(LargeWalWriter *w, const uint8_t *content,
 
     /* Buffer page 0 may be a partially-filled page we read back — keep
      * its existing start_lsn/flags and count the bytes already on it. */
-    if (w->cur_offset > 0) {
+    if (writer->cur_offset > 0) {
         WalPageHeader existing;
-        if (large_wal_page_header_deserialize(w->buf.buf, &existing) == MYDB_OK) {
+        if (large_wal_page_header_deserialize(writer->buf.buf, &existing) == MYDB_OK) {
             pp[0].start_lsn = existing.start_lsn;
             pp[0].flags     = existing.flags;
             pp[0].have_lsn  = 1;
         }
-        pp[0].data_len = w->cur_offset;
+        pp[0].data_len = writer->cur_offset;
     }
 
     uint64_t last_lsn = 0;
@@ -220,7 +220,7 @@ static void pack_batch(LargeWalWriter *w, const uint8_t *content,
             uint32_t room  = LARGE_WAL_PAGE_USABLE - write_pos;
             uint32_t chunk = (rec->len - copied < room) ? rec->len - copied : room;
 
-            uint8_t *dst = w->buf.buf + (size_t)page * PAGE_SIZE
+            uint8_t *dst = writer->buf.buf + (size_t)page * PAGE_SIZE
                           + LARGE_WAL_PAGE_HEADER_ON_DISK_SIZE + write_pos;
 
             for (uint32_t k = 0; k < chunk; k++) {
@@ -266,7 +266,7 @@ static void pack_batch(LargeWalWriter *w, const uint8_t *content,
         hdr.end_lsn      = pp[i].have_lsn ? pp[i].end_lsn   : last_lsn;
         hdr.data_len     = (uint16_t)pp[i].data_len;
         hdr.flags        = pp[i].flags;
-        large_wal_page_header_serialize(&hdr, w->buf.buf + (size_t)i * PAGE_SIZE);
+        large_wal_page_header_serialize(&hdr, writer->buf.buf + (size_t)i * PAGE_SIZE);
     }
 }
 
@@ -280,7 +280,7 @@ static void pack_batch(LargeWalWriter *w, const uint8_t *content,
  * that, so the index entries are right without anything being read back.
  * ------------------------------------------------------------------ */
 
-static int do_write(LargeWalWriter *w, const uint8_t *content, uint32_t total_size,
+static int do_write(LargeWalWriter *writer, const uint8_t *content, uint32_t total_size,
                      LargeWalIndexEntry *out_entries, uint32_t out_cap, uint32_t *out_count)
 {
     *out_count = 0;
@@ -295,64 +295,64 @@ static int do_write(LargeWalWriter *w, const uint8_t *content, uint32_t total_si
         return MYDB_ERR;
 
     uint32_t buf_pages = 0, end_seg_page = 0, end_write_pos = 0;
-    if (plan_layout(w, recs, n, plan, &buf_pages, &end_seg_page, &end_write_pos) != MYDB_OK)
+    if (plan_layout(writer, recs, n, plan, &buf_pages, &end_seg_page, &end_write_pos) != MYDB_OK)
         return MYDB_ERR;
 
     /* Size the buffer by pages: an exact multiple of the usable size
      * makes acquire's own ceil() land on precisely buf_pages. */
-    if (large_wal_buffer_acquire(&w->buf, buf_pages * LARGE_WAL_PAGE_USABLE) != MYDB_OK)
+    if (large_wal_buffer_acquire(&writer->buf, buf_pages * LARGE_WAL_PAGE_USABLE) != MYDB_OK)
         return MYDB_ERR;
 
     /* Seed page 0. Resuming a partially-filled page means its existing
      * bytes and header have to survive, so read them back (a page-cache
      * hit) instead of zeroing over them. */
-    if (w->cur_offset > 0) {
-        if (large_wal_segment_pool_read_page(w->pool, w->cur_slot_index,
-                                              w->cur_page_no, w->buf.buf) != MYDB_OK) {
-            large_wal_buffer_release(&w->buf);
+    if (writer->cur_offset > 0) {
+        if (large_wal_segment_pool_read_page(writer->pool, writer->cur_slot_index,
+                                              writer->cur_page_no, writer->buf.buf) != MYDB_OK) {
+            large_wal_buffer_release(&writer->buf);
             return MYDB_ERR;
         }
-        memset(w->buf.buf + PAGE_SIZE, 0, (size_t)(buf_pages - 1) * PAGE_SIZE);
+        memset(writer->buf.buf + PAGE_SIZE, 0, (size_t)(buf_pages - 1) * PAGE_SIZE);
     } else {
-        memset(w->buf.buf, 0, (size_t)buf_pages * PAGE_SIZE);
+        memset(writer->buf.buf, 0, (size_t)buf_pages * PAGE_SIZE);
     }
 
-    pack_batch(w, content, recs, plan, n, buf_pages, out_entries);
+    pack_batch(writer, content, recs, plan, n, buf_pages, out_entries);
 
-    uint32_t slot    = w->cur_slot_index;
-    uint32_t page_no = w->cur_page_no;
+    uint32_t slot    = writer->cur_slot_index;
+    uint32_t page_no = writer->cur_page_no;
     uint32_t offset  = 0;
-    int rc = large_wal_segment_pool_write(w->pool, w->worker, &slot, &page_no, &offset,
-                                           w->buf.buf, (size_t)buf_pages * PAGE_SIZE);
-    large_wal_buffer_release(&w->buf);
+    int rc = large_wal_segment_pool_write(writer->pool, writer->worker, &slot, &page_no, &offset,
+                                           writer->buf.buf, (size_t)buf_pages * PAGE_SIZE);
+    large_wal_buffer_release(&writer->buf);
     if (rc != MYDB_OK) return rc;
 
     /* Cursor: the plan already says where we ended up. Take the slot
      * from write() (it may have rolled, possibly more than once), and
      * the position from the plan — write()'s own page_no/offset report
      * a page boundary, losing the sub-page position tight packing needs. */
-    w->cur_slot_index = slot;
+    writer->cur_slot_index = slot;
     if (end_seg_page >= LARGE_WAL_SEGMENT_PAGES_PER_FILE) {
         /* The batch ended exactly on the segment's last page, so write()
          * rolled after writing it — we resume at the head of the fresh
          * segment it claimed. */
-        w->cur_page_no = 1;
-        w->cur_offset  = 0;
+        writer->cur_page_no = 1;
+        writer->cur_offset  = 0;
     } else {
-        w->cur_page_no = end_seg_page;
-        w->cur_offset  = end_write_pos;
+        writer->cur_page_no = end_seg_page;
+        writer->cur_offset  = end_write_pos;
     }
-    w->cur_segment_last_lsn = recs[n - 1].lsn;
+    writer->cur_segment_last_lsn = recs[n - 1].lsn;
 
     /* Index only now: an entry is a promise the bytes are on disk, so
      * nothing is inserted until write() has confirmed them. (The reverse
      * failure is benign — durable bytes with no entry are unreachable.) */
     for (uint32_t i = 0; i < n; i++) {
-        if (large_wal_index_insert(w->idx, &out_entries[i]) != MYDB_OK) return MYDB_ERR;
+        if (large_wal_index_insert(writer->idx, &out_entries[i]) != MYDB_OK) return MYDB_ERR;
         (*out_count)++;
     }
 
-    return large_wal_state_advance(w->state, recs[n - 1].lsn);
+    return large_wal_state_advance(writer->state, recs[n - 1].lsn);
 }
 
 /* ------------------------------------------------------------------
@@ -361,34 +361,34 @@ static int do_write(LargeWalWriter *w, const uint8_t *content, uint32_t total_si
 
 static void *writer_main(void *arg)
 {
-    LargeWalWriter *w = (LargeWalWriter *)arg;
+    LargeWalWriter *writer = (LargeWalWriter *)arg;
 
     for (;;) {
-        pthread_mutex_lock(&w->lock);
-        while (!w->request_pending && !w->stop_requested)
-            pthread_cond_wait(&w->cond, &w->lock);
+        pthread_mutex_lock(&writer->lock);
+        while (!writer->request_pending && !writer->stop_requested)
+            pthread_cond_wait(&writer->cond, &writer->lock);
 
-        if (w->stop_requested && !w->request_pending) {
-            pthread_mutex_unlock(&w->lock);
+        if (writer->stop_requested && !writer->request_pending) {
+            pthread_mutex_unlock(&writer->lock);
             break;
         }
 
-        const uint8_t      *content     = w->req_content;
-        uint32_t             total_size  = w->req_total_size;
-        LargeWalIndexEntry  *out_entries = w->req_out_entries;
-        uint32_t             out_cap     = w->req_out_cap;
-        pthread_mutex_unlock(&w->lock);
+        const uint8_t      *content     = writer->req_content;
+        uint32_t             total_size  = writer->req_total_size;
+        LargeWalIndexEntry  *out_entries = writer->req_out_entries;
+        uint32_t             out_cap     = writer->req_out_cap;
+        pthread_mutex_unlock(&writer->lock);
 
         uint32_t count = 0;
-        int rc = do_write(w, content, total_size, out_entries, out_cap, &count);
+        int rc = do_write(writer, content, total_size, out_entries, out_cap, &count);
 
-        pthread_mutex_lock(&w->lock);
-        w->request_pending = 0;
-        w->request_done    = 1;
-        w->last_result      = rc;
-        w->req_out_count    = count;   /* meaningful even when rc != MYDB_OK */
-        pthread_cond_broadcast(&w->cond);
-        pthread_mutex_unlock(&w->lock);
+        pthread_mutex_lock(&writer->lock);
+        writer->request_pending = 0;
+        writer->request_done    = 1;
+        writer->last_result      = rc;
+        writer->req_out_count    = count;   /* meaningful even when rc != MYDB_OK */
+        pthread_cond_broadcast(&writer->cond);
+        pthread_mutex_unlock(&writer->lock);
     }
 
     return NULL;
@@ -398,12 +398,12 @@ static void *writer_main(void *arg)
  * Lifecycle
  * ------------------------------------------------------------------ */
 
-static int find_or_claim_active(LargeWalWriter *w)
+static int find_or_claim_active(LargeWalWriter *writer)
 {
     for (uint32_t i = 0; i < LARGE_WAL_SEGMENT_POOL_SLOTS; i++) {
-        if (w->pool->slots[i].header.state == LSEG_ACTIVE) {
-            w->cur_slot_index = i;
-            w->cur_page_no    = w->pool->slots[i].header.data_pages + 1;
+        if (writer->pool->slots[i].header.state == LSEG_ACTIVE) {
+            writer->cur_slot_index = i;
+            writer->cur_page_no    = writer->pool->slots[i].header.data_pages + 1;
             /* Resume on a fresh page rather than mid-page. The tail-scan
              * that recovered data_pages counts whole valid pages and
              * can't report how full the last one was, so appending into
@@ -411,9 +411,9 @@ static int find_or_claim_active(LargeWalWriter *w)
              * remainder of one page per restart is the cheap, safe
              * choice; recovering it needs the page's own data_len, which
              * is a job for the recovery phase. */
-            w->cur_offset     = 0;
-            return large_wal_registry_register(w->registry, w->pool->slots[i].header.segment_no,
-                                                w->pool->slots[i].fd, /*owns_fd=*/0);
+            writer->cur_offset     = 0;
+            return large_wal_registry_register(writer->registry, writer->pool->slots[i].header.segment_no,
+                                                writer->pool->slots[i].fd, /*owns_fd=*/0);
         }
     }
 
@@ -421,25 +421,25 @@ static int find_or_claim_active(LargeWalWriter *w)
      * register here — unlike the resume path above, where no claim
      * happens and the writer must do it. */
     uint32_t slot;
-    if (large_wal_segment_pool_claim_next(w->pool, &slot) != MYDB_OK) return MYDB_ERR;
-    w->cur_slot_index = slot;
-    w->cur_page_no    = 1;
-    w->cur_offset     = 0;
+    if (large_wal_segment_pool_claim_next(writer->pool, &slot) != MYDB_OK) return MYDB_ERR;
+    writer->cur_slot_index = slot;
+    writer->cur_page_no    = 1;
+    writer->cur_offset     = 0;
     return MYDB_OK;
 }
 
-int large_wal_writer_init(LargeWalWriter *w, LargeWalSegmentPool *pool,
+int large_wal_writer_init(LargeWalWriter *writer, LargeWalSegmentPool *pool,
                            LargeWalRegistry *registry, LargeWalIndex *idx,
                            LargeWalState *state, WalWorker *worker)
 {
-    if (!w || !pool || !registry || !idx || !state) return MYDB_ERR;
+    if (!writer || !pool || !registry || !idx || !state) return MYDB_ERR;
 
-    memset(w, 0, sizeof(*w));
-    w->pool     = pool;
-    w->registry = registry;
-    w->idx      = idx;
-    w->state    = state;
-    w->worker   = worker;
+    memset(writer, 0, sizeof(*writer));
+    writer->pool     = pool;
+    writer->registry = registry;
+    writer->idx      = idx;
+    writer->state    = state;
+    writer->worker   = worker;
 
     /* content_lsn is the same shared, monotonic sequence across the
      * whole engine (confirmed this session), and this writer only ever
@@ -447,46 +447,46 @@ int large_wal_writer_init(LargeWalWriter *w, LargeWalSegmentPool *pool,
      * flush_lsn is the correct "last content_lsn written into the
      * resumed segment" seed on reload -- a genuine value, not a
      * placeholder. */
-    w->cur_segment_last_lsn = state->flush_lsn;
+    writer->cur_segment_last_lsn = state->flush_lsn;
 
-    return find_or_claim_active(w);
+    return find_or_claim_active(writer);
 }
 
-int large_wal_writer_start(LargeWalWriter *w)
+int large_wal_writer_start(LargeWalWriter *writer)
 {
-    if (!w) return MYDB_ERR;
+    if (!writer) return MYDB_ERR;
 
-    if (pthread_mutex_init(&w->lock, NULL) != 0) return MYDB_ERR;
-    if (pthread_cond_init(&w->cond, NULL) != 0) {
-        pthread_mutex_destroy(&w->lock);
+    if (pthread_mutex_init(&writer->lock, NULL) != 0) return MYDB_ERR;
+    if (pthread_cond_init(&writer->cond, NULL) != 0) {
+        pthread_mutex_destroy(&writer->lock);
         return MYDB_ERR;
     }
 
-    w->stop_requested = 0;
-    if (pthread_create(&w->thread, NULL, writer_main, w) != 0) {
-        pthread_cond_destroy(&w->cond);
-        pthread_mutex_destroy(&w->lock);
+    writer->stop_requested = 0;
+    if (pthread_create(&writer->thread, NULL, writer_main, writer) != 0) {
+        pthread_cond_destroy(&writer->cond);
+        pthread_mutex_destroy(&writer->lock);
         return MYDB_ERR;
     }
 
-    w->started = 1;
+    writer->started = 1;
     return MYDB_OK;
 }
 
-int large_wal_writer_stop(LargeWalWriter *w)
+int large_wal_writer_stop(LargeWalWriter *writer)
 {
-    if (!w || !w->started) return MYDB_OK;
+    if (!writer || !writer->started) return MYDB_OK;
 
-    pthread_mutex_lock(&w->lock);
-    w->stop_requested = 1;
-    pthread_cond_broadcast(&w->cond);
-    pthread_mutex_unlock(&w->lock);
+    pthread_mutex_lock(&writer->lock);
+    writer->stop_requested = 1;
+    pthread_cond_broadcast(&writer->cond);
+    pthread_mutex_unlock(&writer->lock);
 
-    pthread_join(w->thread, NULL);
+    pthread_join(writer->thread, NULL);
 
-    pthread_cond_destroy(&w->cond);
-    pthread_mutex_destroy(&w->lock);
-    w->started = 0;
+    pthread_cond_destroy(&writer->cond);
+    pthread_mutex_destroy(&writer->lock);
+    writer->started = 0;
 
     return MYDB_OK;
 }
@@ -495,38 +495,38 @@ int large_wal_writer_stop(LargeWalWriter *w)
  * submit — blocking request/response handoff
  * ------------------------------------------------------------------ */
 
-int large_wal_writer_submit(LargeWalWriter *w, const uint8_t *content, uint32_t total_size,
+int large_wal_writer_submit(LargeWalWriter *writer, const uint8_t *content, uint32_t total_size,
                              LargeWalIndexEntry *out_entries, uint32_t out_cap,
                              uint32_t *out_count)
 {
-    if (!w || !w->started || !content || !out_entries || !out_count || out_cap == 0)
+    if (!writer || !writer->started || !content || !out_entries || !out_count || out_cap == 0)
         return MYDB_ERR;
 
     *out_count = 0;
 
-    pthread_mutex_lock(&w->lock);
-    if (w->stop_requested) {
-        pthread_mutex_unlock(&w->lock);
+    pthread_mutex_lock(&writer->lock);
+    if (writer->stop_requested) {
+        pthread_mutex_unlock(&writer->lock);
         return MYDB_ERR;
     }
 
-    w->req_content     = content;
-    w->req_total_size  = total_size;
-    w->req_out_entries = out_entries;
-    w->req_out_cap     = out_cap;
-    w->req_out_count   = 0;
-    w->request_pending = 1;
-    w->request_done    = 0;
-    pthread_cond_broadcast(&w->cond);
+    writer->req_content     = content;
+    writer->req_total_size  = total_size;
+    writer->req_out_entries = out_entries;
+    writer->req_out_cap     = out_cap;
+    writer->req_out_count   = 0;
+    writer->request_pending = 1;
+    writer->request_done    = 0;
+    pthread_cond_broadcast(&writer->cond);
 
-    while (!w->request_done)
-        pthread_cond_wait(&w->cond, &w->lock);
+    while (!writer->request_done)
+        pthread_cond_wait(&writer->cond, &writer->lock);
 
-    int rc = w->last_result;
+    int rc = writer->last_result;
     /* Reported regardless of rc: on a partial failure this is how many
      * records really did land, durably and indexed. */
-    *out_count = w->req_out_count;
-    pthread_mutex_unlock(&w->lock);
+    *out_count = writer->req_out_count;
+    pthread_mutex_unlock(&writer->lock);
 
     return rc;
 }

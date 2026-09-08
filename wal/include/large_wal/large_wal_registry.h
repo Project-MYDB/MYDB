@@ -7,10 +7,8 @@
 
 /*
  * large_wal_registry.h — the (segment_no -> fd) table spanning a
- * segment's whole life, extracted out of large_wal_archiver (it stopped
- * being archiver-specific the moment large_wal_writer started
- * registering into it too — this is shared infrastructure both the
- * writer and the archiver reach into, not archiver-owned).
+ * segment's whole life, this is shared infrastructure both the
+ * writer and the archiver reach into.
  *
  * large_wal_writer (large_wal_writer.h) calls register() immediately
  * after every claim_next(), passing the rotation slot's own
@@ -24,7 +22,7 @@
  * just two different fds the same segment_no points at over its
  * lifetime.
  *
- * owns_fd exists to fix a latent bug the writer's widening introduced:
+ * owns_fd exists to fix a latent bug:
  * blindly closing every entry's fd on shutdown was correct back when
  * every entry was archiver-opened (Phase 3), but wrong once pool-owned
  * rotation fds joined the same table — closing those here would race

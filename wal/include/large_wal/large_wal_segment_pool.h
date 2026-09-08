@@ -15,11 +15,7 @@
  * files: pre-allocation, round-robin claiming, raw page I/O within a
  * claimed slot, and the crash-reload tail-scan (MYDB_WAL_IMPLEMENTATION.md
  * §10.1). Mirrors normal_wal/wal_segment_pool.h's own original scope
- * exactly — init/reload, claim_next, raw page I/O, finalize, tail_scan —
- * *not* the copy-out-to-holding-area mechanism, the in-memory
- * (segment_no -> fd) table, or LargeWalIndexEntry, all of which are the
- * "archive section" phase's job, not this one's (§10.1/§10.5/§10.6 —
- * a real, separate concern from the rotation pool itself).
+ * exactly — init/reload, claim_next, raw page I/O, finalize, tail_scan.
  *
  * LargeWalSlot (the in-memory runtime handle — fd + cached header) lives
  * here, not in large_wal_segment.h, which covers only the on-disk

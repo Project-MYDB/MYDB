@@ -14,14 +14,59 @@
 
 static int pwrite_all(int fd, const void *buf, size_t n, off_t offset)
 {
-    ssize_t written = pwrite(fd, buf, n, offset);
-    return (written == (ssize_t)n) ? MYDB_OK : MYDB_ERR;
+    const char *ptr = (const char *)buf;
+    size_t total_written = 0;
+
+    while (total_written < n) {
+        ssize_t written = pwrite(fd,
+                                 ptr + total_written,
+                                 n - total_written,
+                                 offset + total_written);
+
+        if (written <= 0) {
+            // Interrupted by a signal; retry the write
+            if (written < 0 && errno == EINTR) {
+                continue;
+            }
+            // Real error (e.g., ENOSPC for out-of-disk-space, EBADF) or unexpected 0 bytes
+            return MYDB_ERR;
+        }
+
+        total_written += (size_t)written;
+    }
+
+    return MYDB_OK;
 }
 
 static int pread_all(int fd, void *buf, size_t n, off_t offset)
 {
-    ssize_t got = pread(fd, buf, n, offset);
-    return (got == (ssize_t)n) ? MYDB_OK : MYDB_ERR;
+    char *ptr = (char *)buf;
+    size_t total_read = 0;
+
+    while (total_read < n) {
+        ssize_t got = pread(fd,
+                            ptr + total_read,
+                            n - total_read,
+                            offset + total_read);
+
+        if (got < 0) {
+            // Interrupted by a signal; retry the read
+            if (errno == EINTR) {
+                continue;
+            }
+            // Fatal read error (e.g., EIO, EBADF)
+            return MYDB_ERR;
+        }
+
+        if (got == 0) {
+            // Reached End-Of-File (EOF) before reading all n bytes
+            return MYDB_ERR;
+        }
+
+        total_read += (size_t)got;
+    }
+
+    return MYDB_OK;
 }
 
 static int save(LargeWalState *st)

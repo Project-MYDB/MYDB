@@ -14,9 +14,7 @@
 /*
  * large_wal_writer.h — the LARGE_WAL Writer thread (MYDB_WAL_
  * IMPLEMENTATION.md Appendix A: "single dedicated thread, packs content
- * into rotation segments, fsyncs, advances large_wal_flush_lsn"). NOT
- * the storage engine's buffer-pool page writer — a different, unrelated
- * component with a similar name.
+ * into rotation segments, fsyncs, advances large_wal_flush_lsn")
  *
  * Owns its LargeWalBuffer (per §10.10 — "the staging area the LARGE_WAL
  * Writer packs content into") and its own live cursor
@@ -62,11 +60,11 @@
  */
 
 typedef struct {
-    LargeWalSegmentPool *pool;      /* not owned */
-    LargeWalRegistry      *registry; /* not owned */
+    LargeWalSegmentPool      *pool;      /* not owned */
+    LargeWalRegistry         *registry; /* not owned */
     LargeWalIndex            *idx;    /* not owned */
-    LargeWalState              *state; /* not owned */
-    WalWorker                    *worker; /* not owned; may be NULL — see large_wal_writer_init */
+    LargeWalState            *state; /* not owned */
+    WalWorker                *worker; /* not owned; may be NULL — see large_wal_writer_init */
 
     LargeWalBuffer  buf;   /* OWNED — embedded, per §10.10 */
 
@@ -100,11 +98,11 @@ typedef struct {
     /* single-slot request/response mailbox — content and out_entries are
      * borrowed pointers, valid for the call's duration since submit()
      * blocks */
-    uint8_t                request_pending;
-    uint8_t                request_done;
-    int                      last_result;
-    const uint8_t             *req_content;
-    uint32_t                    req_total_size;
+    uint8_t                       request_pending;
+    uint8_t                       request_done;
+    int                           last_result;
+    const uint8_t                *req_content;
+    uint32_t                      req_total_size;
     LargeWalIndexEntry           *req_out_entries;
     uint32_t                       req_out_cap;
     uint32_t                       req_out_count;
@@ -118,16 +116,16 @@ typedef struct {
  * stored and forwarded into every large_wal_segment_pool_write()/
  * mark_done() call this writer makes — see large_wal_segment_pool.h's
  * own worker parameter doc comments. */
-int large_wal_writer_init(LargeWalWriter *w, LargeWalSegmentPool *pool,
+int large_wal_writer_init(LargeWalWriter *writer, LargeWalSegmentPool *pool,
                            LargeWalRegistry *registry, LargeWalIndex *idx,
                            LargeWalState *state, WalWorker *worker);
 
 /* Starts the background thread. init() must have succeeded first. */
-int large_wal_writer_start(LargeWalWriter *w);
+int large_wal_writer_start(LargeWalWriter *writer);
 
 /* Signals stop, joins the thread. Safe to call even if start() was
  * never called, or after an earlier stop() — a no-op in both cases. */
-int large_wal_writer_stop(LargeWalWriter *w);
+int large_wal_writer_stop(LargeWalWriter *writer);
 
 /* Blocking. Wakes the thread, waits for this batch to be packed,
  * written, indexed, and durably flush_lsn-advanced before returning.
@@ -148,7 +146,7 @@ int large_wal_writer_stop(LargeWalWriter *w);
  * several segments is written run by run, so a mid-batch failure leaves
  * the earlier records genuinely durable and indexed, and *out_count
  * says exactly how many. */
-int large_wal_writer_submit(LargeWalWriter *w, const uint8_t *content, uint32_t total_size,
+int large_wal_writer_submit(LargeWalWriter *writer, const uint8_t *content, uint32_t total_size,
                              LargeWalIndexEntry *out_entries, uint32_t out_cap,
                              uint32_t *out_count);
 
