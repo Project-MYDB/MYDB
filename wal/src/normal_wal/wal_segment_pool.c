@@ -230,8 +230,10 @@ int wal_segment_pool_claim_next(WalSegmentPool *pool, uint32_t *out_slot_index)
 }
 
 int wal_segment_pool_mark_done(WalSegmentPool *pool, WalWorker *worker,
-                               uint32_t slot_index, uint64_t end_lsn, uint32_t data_pages)
+                               uint32_t slot_index, uint64_t end_lsn, uint32_t data_pages,
+                               uint64_t *out_ticket)
 {
+    if (out_ticket) *out_ticket = 0;
     if (!pool || slot_index >= WAL_SEGMENT_POOL_SLOTS) return MYDB_ERR;
 
     WalSlot *slot = &pool->slots[slot_index];
@@ -250,7 +252,13 @@ int wal_segment_pool_mark_done(WalSegmentPool *pool, WalWorker *worker,
 
     if (pwrite_all(slot->fd, page_buf, WAL_PAGE_SIZE, 0) != MYDB_OK) return MYDB_ERR;
     if (worker) {
-        if (wal_worker_async_fdatasync(worker, slot->fd) != MYDB_OK) return MYDB_ERR;
+        /* out_ticket is written by async_fdatasync itself, in the same
+         * call that posts -- so it is set before any later step here can
+         * fail. That ordering is the point: a mark_done that posts and
+         * then returns an error would otherwise leave its caller with no
+         * ticket to drain with, and an undrained mailbox blocks the next
+         * post forever, for the whole partition. */
+        if (wal_worker_async_fdatasync(worker, slot->fd, out_ticket) != MYDB_OK) return MYDB_ERR;
     } else {
         if (fdatasync(slot->fd) < 0) return MYDB_ERR;
     }
@@ -319,6 +327,13 @@ int wal_segment_pool_write(WalSegmentPool *pool, WalWorker *worker,
      * not just this call. */
     int rc = MYDB_OK;
 
+    /* Names the fsync mark_done() handed to worker, if this call rolled
+     * over at all. Stays 0 otherwise, and wal_worker_wait() treats 0 as
+     * "I posted nothing" -- which is what lets the drain at `out:` stay
+     * unconditional without ever collecting the OTHER caller thread's
+     * result. Both WAL paths share one WalWorker (wal_manager.h). */
+    uint64_t flush_ticket = 0;
+
     size_t written = 0;
     while (written < buf_len) {
         uint32_t room_left = WAL_PAGE_SIZE - *offset;
@@ -362,7 +377,8 @@ int wal_segment_pool_write(WalSegmentPool *pool, WalWorker *worker,
 
             uint32_t finished_slot       = *slot_index;
             uint32_t finished_data_pages = *page_no;
-            if (wal_segment_pool_mark_done(pool, worker, finished_slot, seg_end_lsn, finished_data_pages) != MYDB_OK) {
+            if (wal_segment_pool_mark_done(pool, worker, finished_slot, seg_end_lsn,
+                                           finished_data_pages, &flush_ticket) != MYDB_OK) {
                 rc = MYDB_ERR;
                 goto out;
             }
@@ -403,7 +419,7 @@ out:
      * including on the error paths above: draining is what keeps the
      * shared mailbox usable, and the worker's own result still counts
      * toward what we report. */
-    if (worker && wal_worker_wait(worker) != MYDB_OK) rc = MYDB_ERR;
+    if (worker && wal_worker_wait(worker, flush_ticket) != MYDB_OK) rc = MYDB_ERR;
 
     return rc;
 }

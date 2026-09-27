@@ -226,9 +226,15 @@ int large_wal_segment_pool_read_page(LargeWalSegmentPool *pool, uint32_t slot_in
  * rollover branch can safely overlap with writing the new segment,
  * waiting on the worker only once that's also done. Callers that pass
  * a worker must eventually call wal_worker_wait() before relying on
- * this segment's DONE state being durable. */
+ * this segment's DONE state being durable — with the ticket handed back through
+ * out_ticket, which names the fsync this call posted. out_ticket may be
+ * NULL (it is meaningless when worker is NULL), and is left at 0 unless
+ * a request was actually posted, so a caller that zero-initialises it
+ * and passes the same variable down every path always waits on exactly
+ * what it submitted, and on nothing when it submitted nothing. */
 int large_wal_segment_pool_mark_done(LargeWalSegmentPool *pool, WalWorker *worker,
-                                     uint32_t slot_index, uint64_t end_lsn, uint32_t data_pages);
+                                     uint32_t slot_index, uint64_t end_lsn, uint32_t data_pages,
+                                     uint64_t *out_ticket);
 
 /* LSEG_DONE -> LSEG_FREE: called by the archiver only after the
  * holding-area copy's fsync has confirmed (impl doc §10.1's ordering

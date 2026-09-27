@@ -64,14 +64,14 @@ static void test_init_and_shutdown_wire_the_shared_worker(void)
     WalManager wm;
     CHECK(wal_manager_init(&wm, TEST_WAL_DIR, 1) == MYDB_OK,
           "a single init() call brings up the shared worker + both sub-managers");
-    CHECK(wm.worker.started == 1, "the shared worker thread was started");
+    CHECK(wm.worker.mb.started == 1, "the shared worker thread was started");
     CHECK(wm.nwm.flusher.worker == &wm.worker,
           "normal_wal's Flusher was handed a pointer to the same shared worker");
     CHECK(wm.lwm.lw_writer.worker == &wm.worker,
           "large_wal's writer was handed a pointer to the same shared worker");
 
     CHECK(wal_manager_shutdown(&wm) == MYDB_OK, "shutdown() succeeds cleanly");
-    CHECK(wm.worker.started == 0, "the shared worker was stopped by shutdown()");
+    CHECK(wm.worker.mb.started == 0, "the shared worker was stopped by shutdown()");
 
     cleanup();
 }

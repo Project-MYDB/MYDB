@@ -65,12 +65,12 @@ static void test_init_and_shutdown_bring_up_all_subpieces(void)
           "a single init() call brings up pool/registry/index/state/archiver/writer");
     CHECK(mgr.partition_id == 1, "mgr's own partition_id is set");
     CHECK(strcmp(mgr.wal_dir, TEST_WAL_DIR) == 0, "mgr's own wal_dir is set");
-    CHECK(mgr.lw_writer.started == 1, "the writer thread was started as part of init()");
+    CHECK(mgr.lw_writer.mb.started == 1, "the writer thread was started as part of init()");
     CHECK(mgr.lw_pool.slots[mgr.lw_writer.cur_slot_index].header.state == LSEG_ACTIVE,
           "init() claimed an active segment for the writer to use");
 
     CHECK(large_wal_manager_shutdown(&mgr) == MYDB_OK, "shutdown() succeeds cleanly");
-    CHECK(mgr.lw_writer.started == 0, "the writer thread was stopped by shutdown()");
+    CHECK(mgr.lw_writer.mb.started == 0, "the writer thread was stopped by shutdown()");
 
     cleanup();
 }

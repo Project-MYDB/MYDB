@@ -1,4 +1,5 @@
 add_library(wal STATIC
+    src/wal_mailbox.c
     src/wal_worker.c
     src/wal_manager.c
     src/wal_page.c
@@ -25,7 +26,9 @@ add_library(wal STATIC
 # checksum). Phase 2: the 4-slot rotation pool. Phase 3: the archive
 # section (holding area + index + archiver). Phase 4: the static staging
 # buffer. Phase 5: the large_wal_writer thread + large_wal_state.mydb.
-# Then: wal_worker (shared background fsync-offload thread) +
+# Then: wal_mailbox (the shared background-thread + request/response
+# queue both mailboxes were hand-written copies of) + wal_worker (the
+# fsync-offload thread built on it) +
 # normal_wal_manager + wal_manager (top-level, owns the worker + both
 # subsystems' managers) for overlapping a segment rollover's two fsyncs.
 # All mirror normal_wal's own equivalent phases where one exists

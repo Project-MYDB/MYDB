@@ -713,7 +713,7 @@ static void test_claim_next_wait(void)
     uint64_t seg_no = 0;
     uint8_t  state  = 0;
     large_wal_segment_pool_slot_info(&pool, 0, &seg_no, &state);
-    CHECK(large_wal_segment_pool_mark_done(&pool, NULL, 0, /*end_lsn=*/1, /*data_pages=*/1) == MYDB_OK,
+    CHECK(large_wal_segment_pool_mark_done(&pool, NULL, 0, /*end_lsn=*/1, /*data_pages=*/1, NULL) == MYDB_OK,
           "slot 0 marked DONE, ready to be freed");
 
     ClaimWaitArgs a;

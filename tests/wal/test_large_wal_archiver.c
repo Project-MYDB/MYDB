@@ -121,7 +121,7 @@ static void build_done_segment(LargeWalSegmentPool *pool, LargeWalRegistry *reg,
     CHECK(large_wal_segment_pool_write_page(pool, slot_index, 1, page_a) == MYDB_OK, "write page 1");
     CHECK(large_wal_segment_pool_write_page(pool, slot_index, 2, page_b) == MYDB_OK, "write page 2");
 
-    CHECK(large_wal_segment_pool_mark_done(pool, NULL, slot_index, 500, 2) == MYDB_OK, "mark_done succeeds");
+    CHECK(large_wal_segment_pool_mark_done(pool, NULL, slot_index, 500, 2, NULL) == MYDB_OK, "mark_done succeeds");
 
     *out_slot_index = slot_index;
     *out_segment_no = segment_no;

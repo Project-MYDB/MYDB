@@ -392,7 +392,7 @@ static void test_free_slot_zeroes_content(void)
         large_wal_segment_pool_write_page(&pool, slot_index, p, page_buf);
     }
 
-    large_wal_segment_pool_mark_done(&pool, NULL, slot_index, 505, 5);
+    large_wal_segment_pool_mark_done(&pool, NULL, slot_index, 505, 5, NULL);
     CHECK(large_wal_segment_pool_free_slot(&pool, slot_index) == MYDB_OK, "free_slot succeeds");
     CHECK(pool.slots[slot_index].header.state == LSEG_FREE, "the slot is LSEG_FREE");
 
@@ -441,7 +441,7 @@ static void test_reused_slot_does_not_inherit_stale_pages(void)
         build_page(page_buf, 1000 + p, 0xA1);
         large_wal_segment_pool_write_page(&pool, first_slot, p, page_buf);
     }
-    large_wal_segment_pool_mark_done(&pool, NULL, first_slot, 1020, 20);
+    large_wal_segment_pool_mark_done(&pool, NULL, first_slot, 1020, 20, NULL);
     large_wal_segment_pool_free_slot(&pool, first_slot);
 
     /* Round-robin over 4 slots brings us back to the same file. */

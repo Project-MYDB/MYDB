@@ -10,6 +10,7 @@
 #include "large_wal/large_wal_state.h"
 #include "large_wal/large_wal_buffer.h"
 #include "wal_worker.h"
+#include "wal_mailbox.h"
 
 /*
  * large_wal_writer.h — the LARGE_WAL Writer thread (MYDB_WAL_
@@ -22,11 +23,26 @@
  * cursor across calls" pattern wal_segment_pool_write's own params and
  * WalFlusher's buf_cursor/seg_cursor already use.
  *
- * submit() is a blocking request/response handoff over one mutex+
- * condvar, not a general async queue — the engine's whole execution
- * model is single-statement-in-flight (CLAUDE.md's Concurrency model),
- * and §10.7's Commit Wait Rule is phrased as a wait, not a callback, so
- * at most one large-record write is ever in flight system-wide. This
+ * submit() is a blocking request/response handoff, not a general async
+ * queue — the engine's whole execution model is
+ * single-statement-in-flight (CLAUDE.md's Concurrency model), and
+ * §10.7's Commit Wait Rule is phrased as a wait, not a callback, so at
+ * most one large-record write is ever in flight system-wide. That
+ * one-at-a-time property is ENFORCED rather than merely assumed: the
+ * mailbox runs at max_depth 1, so a second caller queues at the depth
+ * gate instead of corrupting the first one's request.
+ *
+ * The mutex, condvar, thread and three-flag handshake that used to be
+ * written out here now live in WalMailbox (wal_mailbox.h) — the same
+ * utility wal_worker sits on. submit() is a single wal_mailbox_call(),
+ * and do_write() is the handler it runs. What that does NOT give you is
+ * throughput or batching: at depth 1, N callers still serialize end to
+ * end, one fsync each. Group commit (drain the queue, one pack, one
+ * write, one fsync) and who assigns LSNs under concurrency are both
+ * still open, and the LSN question has to be settled first — raising
+ * this mailbox's depth without it lets a higher content_lsn be written
+ * before a lower one, and large_wal_state_advance rejects the lower one
+ * AFTER its bytes are already durable and indexed. This
  * also means no separate large_wal_flush_lsn query API is needed: if
  * submit() returns MYDB_OK, large_wal_flush_lsn has already advanced to
  * at least this record's content_lsn (persisted+fsynced before submit()
@@ -89,23 +105,25 @@ typedef struct {
                                           submit closes this segment
                                           early via manual rollover */
 
-    pthread_t        thread;
-    pthread_mutex_t  lock;
-    pthread_cond_t   cond;
-    uint8_t          started;
-    uint8_t          stop_requested;
-
-    /* single-slot request/response mailbox — content and out_entries are
-     * borrowed pointers, valid for the call's duration since submit()
-     * blocks */
-    uint8_t                       request_pending;
-    uint8_t                       request_done;
-    int                           last_result;
-    const uint8_t                *req_content;
-    uint32_t                      req_total_size;
-    LargeWalIndexEntry           *req_out_entries;
-    uint32_t                       req_out_cap;
-    uint32_t                       req_out_count;
+    /* The thread and the request/response handoff, both of them. Started
+     * at max_depth 1, which is what makes "at most one large-record
+     * write in flight" a guarantee rather than an assumption.
+     *
+     * The request itself no longer lives in this struct: submit() builds
+     * a LargeWalWriteReq on its own stack and hands it to
+     * wal_mailbox_call(), which copies it into a node on that same
+     * stack. content and out_entries stay borrowed pointers inside that
+     * copy, which is safe for exactly the old reason — submit() is
+     * parked in the call for the whole write, so its frame cannot go
+     * away. out_count comes back the same way, so the count is now a
+     * value in the caller's own frame instead of a field several threads
+     * could read.
+     *
+     * The mutex, condvar and the pending/done pair are gone from here
+     * because WalMailbox owns them, and with them the one-shared-answer
+     * problem: every request carries its own done flag and result, so no
+     * caller can collect another's. */
+    WalMailbox  mb;
 } LargeWalWriter;
 
 /* Seeds cur_slot_index/cur_page_no from whatever segment is already

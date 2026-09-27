@@ -122,6 +122,16 @@ add_executable(test_wal_flusher wal/test_wal_flusher.c)
 target_link_libraries(test_wal_flusher PRIVATE wal)
 add_test(NAME test_wal_flusher COMMAND test_wal_flusher)
 
+# wal_mailbox — the shared background-thread + request/response queue
+# that wal_worker and LargeWalWriter's submit() were both hand-written
+# copies of. Tests the four rules its header now owns: the depth slot
+# comes back on collect (not on handler completion), a queued request is
+# still served during shutdown, waiting on an unposted node is a no-op,
+# and two callers in flight each collect their own result.
+add_executable(test_wal_mailbox wal/test_wal_mailbox.c)
+target_link_libraries(test_wal_mailbox PRIVATE wal)
+add_test(NAME test_wal_mailbox COMMAND test_wal_mailbox)
+
 # wal_worker — the shared persistent background thread that overlaps a
 # segment rollover's two distinct-file fsyncs (old segment's mark_done,
 # new segment's trailing write) instead of paying for them sequentially.

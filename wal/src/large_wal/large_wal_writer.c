@@ -356,42 +356,37 @@ static int do_write(LargeWalWriter *writer, const uint8_t *content, uint32_t tot
 }
 
 /* ------------------------------------------------------------------
- * Thread loop
+ * The mailbox request, and the handler that runs it
+ *
+ * One submit() = one of these. It is built on the submitting thread's
+ * stack, copied into a mailbox node on that same stack, and handed to
+ * the writer thread; out_count travels back out the same way. content
+ * and out_entries stay borrowed pointers because submit() blocks for the
+ * whole round trip.
  * ------------------------------------------------------------------ */
 
-static void *writer_main(void *arg)
+typedef struct {
+    const uint8_t      *content;
+    uint32_t            total_size;
+    LargeWalIndexEntry *out_entries;
+    uint32_t            out_cap;
+    uint32_t            out_count;   /* written back by the handler */
+} LargeWalWriteReq;
+
+_Static_assert(sizeof(LargeWalWriteReq) <= WAL_MAILBOX_MAX_PAYLOAD,
+               "LargeWalWriteReq must fit in a mailbox payload");
+
+/* Runs on the writer thread, no mailbox lock held. out_count is set even
+ * when do_write fails: a batch spanning several segments is written run
+ * by run, so a mid-batch failure leaves the earlier records genuinely
+ * durable and indexed, and the count says exactly how many. */
+static int writer_handle(void *owner, void *request)
 {
-    LargeWalWriter *writer = (LargeWalWriter *)arg;
+    LargeWalWriter   *writer = (LargeWalWriter *)owner;
+    LargeWalWriteReq *r      = (LargeWalWriteReq *)request;
 
-    for (;;) {
-        pthread_mutex_lock(&writer->lock);
-        while (!writer->request_pending && !writer->stop_requested)
-            pthread_cond_wait(&writer->cond, &writer->lock);
-
-        if (writer->stop_requested && !writer->request_pending) {
-            pthread_mutex_unlock(&writer->lock);
-            break;
-        }
-
-        const uint8_t      *content     = writer->req_content;
-        uint32_t             total_size  = writer->req_total_size;
-        LargeWalIndexEntry  *out_entries = writer->req_out_entries;
-        uint32_t             out_cap     = writer->req_out_cap;
-        pthread_mutex_unlock(&writer->lock);
-
-        uint32_t count = 0;
-        int rc = do_write(writer, content, total_size, out_entries, out_cap, &count);
-
-        pthread_mutex_lock(&writer->lock);
-        writer->request_pending = 0;
-        writer->request_done    = 1;
-        writer->last_result      = rc;
-        writer->req_out_count    = count;   /* meaningful even when rc != MYDB_OK */
-        pthread_cond_broadcast(&writer->cond);
-        pthread_mutex_unlock(&writer->lock);
-    }
-
-    return NULL;
+    return do_write(writer, r->content, r->total_size,
+                    r->out_entries, r->out_cap, &r->out_count);
 }
 
 /* ------------------------------------------------------------------
@@ -456,39 +451,16 @@ int large_wal_writer_start(LargeWalWriter *writer)
 {
     if (!writer) return MYDB_ERR;
 
-    if (pthread_mutex_init(&writer->lock, NULL) != 0) return MYDB_ERR;
-    if (pthread_cond_init(&writer->cond, NULL) != 0) {
-        pthread_mutex_destroy(&writer->lock);
-        return MYDB_ERR;
-    }
-
-    writer->stop_requested = 0;
-    if (pthread_create(&writer->thread, NULL, writer_main, writer) != 0) {
-        pthread_cond_destroy(&writer->cond);
-        pthread_mutex_destroy(&writer->lock);
-        return MYDB_ERR;
-    }
-
-    writer->started = 1;
-    return MYDB_OK;
+    /* Depth 1: one large-record write in flight, a second submitter
+     * waits at the gate. Raising this needs the LSN-ordering question
+     * settled first -- see the header. */
+    return wal_mailbox_start(&writer->mb, writer_handle, writer, /*max_depth=*/1);
 }
 
 int large_wal_writer_stop(LargeWalWriter *writer)
 {
-    if (!writer || !writer->started) return MYDB_OK;
-
-    pthread_mutex_lock(&writer->lock);
-    writer->stop_requested = 1;
-    pthread_cond_broadcast(&writer->cond);
-    pthread_mutex_unlock(&writer->lock);
-
-    pthread_join(writer->thread, NULL);
-
-    pthread_cond_destroy(&writer->cond);
-    pthread_mutex_destroy(&writer->lock);
-    writer->started = 0;
-
-    return MYDB_OK;
+    if (!writer) return MYDB_OK;
+    return wal_mailbox_stop(&writer->mb);
 }
 
 /* ------------------------------------------------------------------
@@ -499,34 +471,29 @@ int large_wal_writer_submit(LargeWalWriter *writer, const uint8_t *content, uint
                              LargeWalIndexEntry *out_entries, uint32_t out_cap,
                              uint32_t *out_count)
 {
-    if (!writer || !writer->started || !content || !out_entries || !out_count || out_cap == 0)
+    if (!writer || !content || !out_entries || !out_count || out_cap == 0)
         return MYDB_ERR;
 
     *out_count = 0;
 
-    pthread_mutex_lock(&writer->lock);
-    if (writer->stop_requested) {
-        pthread_mutex_unlock(&writer->lock);
-        return MYDB_ERR;
-    }
+    LargeWalWriteReq req;
+    memset(&req, 0, sizeof(req));
+    req.content     = content;
+    req.total_size  = total_size;
+    req.out_entries = out_entries;
+    req.out_cap     = out_cap;
+    req.out_count   = 0;
 
-    writer->req_content     = content;
-    writer->req_total_size  = total_size;
-    writer->req_out_entries = out_entries;
-    writer->req_out_cap     = out_cap;
-    writer->req_out_count   = 0;
-    writer->request_pending = 1;
-    writer->request_done    = 0;
-    pthread_cond_broadcast(&writer->cond);
+    /* post + wait in one go, on a node this call owns. Fails rather than
+     * hanging if the writer was never started or is stopping -- the
+     * mailbox's own post() checks both. */
+    int rc = wal_mailbox_call(&writer->mb, &req, sizeof(req));
 
-    while (!writer->request_done)
-        pthread_cond_wait(&writer->cond, &writer->lock);
-
-    int rc = writer->last_result;
     /* Reported regardless of rc: on a partial failure this is how many
-     * records really did land, durably and indexed. */
-    *out_count = writer->req_out_count;
-    pthread_mutex_unlock(&writer->lock);
+     * records really did land, durably and indexed. Left at 0 when the
+     * request never ran, since call() only copies back once the handler
+     * has been through it. */
+    *out_count = req.out_count;
 
     return rc;
 }

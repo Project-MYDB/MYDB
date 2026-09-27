@@ -3,35 +3,20 @@
 #include <unistd.h>
 #include <string.h>
 
-static void *worker_main(void *arg)
+/* ------------------------------------------------------------------
+ * The whole job. Runs on the mailbox thread with no lock held.
+ * ------------------------------------------------------------------ */
+
+static int do_fdatasync(void *owner, void *request)
 {
-    WalWorker *w = (WalWorker *)arg;
-
-    for (;;) {
-        pthread_mutex_lock(&w->lock);
-        while (!w->pending && !w->stop_requested)
-            pthread_cond_wait(&w->cond, &w->lock);
-
-        if (w->stop_requested && !w->pending) {
-            pthread_mutex_unlock(&w->lock);
-            break;
-        }
-
-        int fd = w->req_fd;
-        pthread_mutex_unlock(&w->lock);
-
-        int result = (fdatasync(fd) < 0) ? MYDB_ERR : MYDB_OK;
-
-        pthread_mutex_lock(&w->lock);
-        w->pending     = 0;
-        w->done        = 1;
-        w->last_result = result;
-        pthread_cond_broadcast(&w->cond);
-        pthread_mutex_unlock(&w->lock);
-    }
-
-    return NULL;
+    (void)owner;
+    int fd = *(const int *)request;
+    return (fdatasync(fd) < 0) ? MYDB_ERR : MYDB_OK;
 }
+
+/* ------------------------------------------------------------------
+ * Lifecycle
+ * ------------------------------------------------------------------ */
 
 int wal_worker_start(WalWorker *w)
 {
@@ -39,79 +24,58 @@ int wal_worker_start(WalWorker *w)
 
     memset(w, 0, sizeof(*w));
 
-    if (pthread_mutex_init(&w->lock, NULL) != 0) return MYDB_ERR;
-    if (pthread_cond_init(&w->cond, NULL) != 0) {
-        pthread_mutex_destroy(&w->lock);
-        return MYDB_ERR;
-    }
-
-    if (pthread_create(&w->thread, NULL, worker_main, w) != 0) {
-        pthread_cond_destroy(&w->cond);
-        pthread_mutex_destroy(&w->lock);
-        return MYDB_ERR;
-    }
-
-    w->started = 1;
-    return MYDB_OK;
+    /* Depth 1: one fsync in flight, a second caller waits its turn. That
+     * is also what lets the single node above be shared by both caller
+     * threads — see wal_mailbox.h. */
+    return wal_mailbox_start(&w->mb, do_fdatasync, w, /*max_depth=*/1);
 }
 
 int wal_worker_stop(WalWorker *w)
 {
-    if (!w || !w->started) return MYDB_OK;
+    if (!w) return MYDB_OK;
+    return wal_mailbox_stop(&w->mb);
+}
 
-    pthread_mutex_lock(&w->lock);
-    w->stop_requested = 1;
-    pthread_cond_broadcast(&w->cond);
-    pthread_mutex_unlock(&w->lock);
+/* ------------------------------------------------------------------
+ * Submit / collect
+ * ------------------------------------------------------------------ */
 
-    pthread_join(w->thread, NULL);
+int wal_worker_async_fdatasync(WalWorker *w, int fd, uint64_t *out_ticket)
+{
+    if (out_ticket) *out_ticket = 0;
+    if (!w) return MYDB_ERR;
 
-    pthread_cond_destroy(&w->cond);
-    pthread_mutex_destroy(&w->lock);
-    w->started = 0;
+    /* fd is a plain local: post() copies it into the node inside the
+     * mailbox lock, past the depth gate. That ordering is the reason the
+     * old `w->req_fd` field is gone — writing the fd into the worker
+     * before posting would let two caller threads overwrite each other's
+     * fd, and whichever won the gate would fsync the wrong file. */
+    int rc = wal_mailbox_post(&w->mb, &w->node, &fd, sizeof(fd));
+    if (rc != MYDB_OK) return rc;
 
+    if (out_ticket) *out_ticket = w->node.seq;
     return MYDB_OK;
 }
 
-int wal_worker_async_fdatasync(WalWorker *w, int fd)
+int wal_worker_wait(WalWorker *w, uint64_t ticket)
 {
-    if (!w || !w->started) return MYDB_ERR;
+    /* The caller posted nothing, so there is nothing of theirs to
+     * collect. Answered before anything else: this is the common case on
+     * every write() that did not roll over. Note what is NOT tested
+     * here -- whether the mailbox is busy. It may well be, with the
+     * other caller thread's fsync, and that is precisely the request
+     * this call must leave alone. */
+    if (ticket == 0) return MYDB_OK;
 
-    pthread_mutex_lock(&w->lock);
+    if (!w) return MYDB_ERR;
 
-    /* Wait until any previous request has been fully consumed via
-     * wait() before accepting a new one -- one in-flight request at a
-     * time, regardless of which caller thread submits it. */
-    while (w->pending || w->done)
-        pthread_cond_wait(&w->cond, &w->lock);
+    /* Not the request in flight. Since a ticket is handed to exactly one
+     * caller and node.seq is cleared once collected, this means it was
+     * already waited on -- a caller bug, reported rather than swallowed.
+     * Read unlocked, like wal_mailbox_wait's own seq check, because seq
+     * is only ever written by the node's owner under the mailbox lock
+     * and never by the mailbox thread. */
+    if (w->node.seq != ticket) return MYDB_ERR;
 
-    w->req_fd  = fd;
-    w->pending = 1;
-    w->done    = 0;
-    pthread_cond_broadcast(&w->cond);
-
-    pthread_mutex_unlock(&w->lock);
-    return MYDB_OK;
-}
-
-int wal_worker_wait(WalWorker *w)
-{
-    if (!w || !w->started) return MYDB_ERR;
-
-    pthread_mutex_lock(&w->lock);
-
-    if (!w->pending && !w->done) {
-        pthread_mutex_unlock(&w->lock);
-        return MYDB_OK;   /* nothing was ever submitted -- cheap no-op */
-    }
-
-    while (!w->done)
-        pthread_cond_wait(&w->cond, &w->lock);
-
-    int result = w->last_result;
-    w->done = 0;
-    pthread_cond_broadcast(&w->cond);   /* wake any async_fdatasync waiting for IDLE */
-
-    pthread_mutex_unlock(&w->lock);
-    return result;
+    return wal_mailbox_wait(&w->mb, &w->node, NULL, 0);
 }
