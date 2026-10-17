@@ -7,9 +7,9 @@
 #include "wal_mailbox.h"
 
 /*
- * wal_worker.h — one persistent background thread, shared by both
- * normal_wal and large_wal (owned by the top-level WalManager,
- * wal_manager.h), used to overlap a segment rollover's two genuinely
+ * wal_worker.h — one persistent background thread, owned by WalManager
+ * (wal_manager.h) and handed to the Flusher, used to overlap a segment
+ * rollover's two genuinely
  * distinct-file fsyncs instead of paying for them sequentially.
  *
  * A rollover does mark_done() (old segment's header) then eventually a
@@ -24,9 +24,9 @@
  * All of the threading now lives in WalMailbox (wal_mailbox.h): the
  * thread, the queue, the depth gate, the shutdown handshake, and the
  * four easy-to-break rules that used to be commented here and in the
- * two segment pools. What is left in this file is the narrow part — an
- * fdatasync, and the ticket bookkeeping that keeps the two caller
- * threads' results apart.
+ * two segment pools (the WAL's and large_wal's). What is left in this
+ * file is the narrow part — an fdatasync, and the ticket bookkeeping
+ * that keeps caller threads' results apart.
  *
  * Started at max_depth == 1, which is the strict one-in-flight handoff
  * this worker has always had: async_fdatasync() blocks (briefly, only
@@ -52,8 +52,8 @@
  * and will only ever report on that one. A caller that posted nothing
  * passes 0 and gets MYDB_OK without touching the mailbox at all.
  *
- * Why it matters here and not in a single-caller mailbox: both
- * wal_segment_pool_write() and large_wal_segment_pool_write() call
+ * Why it mattered here and not in a single-caller mailbox: both
+ * wal_segment_pool_write() and large_wal_segment_pool_write() called
  * wait() UNCONDITIONALLY at their `out:` label, whether or not this
  * particular call rolled over and posted anything. That is deliberate
  * (it is what makes the drain rule impossible to forget on an error
@@ -62,6 +62,11 @@
  * that thread consumed the other's result and the real submitter then
  * found an empty mailbox and read success — a failed WAL fsync reported
  * as durable.
+ *
+ * With large_wal moved out, the Flusher is the only caller thread today,
+ * so the collision cannot happen right now. The tickets stay: they cost
+ * nothing, and any second caller (a checkpointer, an archiver) brings
+ * the same hazard straight back.
  * ------------------------------------------------------------------
  */
 
@@ -79,8 +84,9 @@ int wal_worker_stop(WalWorker *w);
 
 /* Hands fd off to the background thread for fdatasync() and returns
  * immediately. Blocks only if a previous request hasn't been wait()'d
- * on yet (the rare collision between normal_wal's and large_wal's
- * threads sharing this one worker) — otherwise returns without
+ * on yet (a collision between two caller threads sharing this one
+ * worker; there were two while large_wal existed, the Flusher is the
+ * only one now) — otherwise returns without
  * waiting for the fdatasync itself to complete.
  *
  * out_ticket (may be NULL) receives the number naming this request.

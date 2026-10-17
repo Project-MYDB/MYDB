@@ -1,4 +1,4 @@
-#include "normal_wal/wal_segment.h"
+#include "wal_segment.h"
 #include "checksum.h"
 
 #include <string.h>

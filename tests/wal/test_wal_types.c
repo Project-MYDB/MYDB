@@ -3,9 +3,10 @@
 #include <string.h>
 
 #include "common.h"
-#include "normal_wal/wal_types.h"
+#include "wal_types.h"
 #include "wal_page.h"
-#include "normal_wal/wal_segment.h"
+#include "wal_segment.h"
+#include "checksum.h"
 
 static int tests_run    = 0;
 static int tests_passed = 0;
@@ -20,7 +21,8 @@ static int tests_passed = 0;
 
 /* WalRecordHeader/WalPageHeader/WalSegmentHeader are plain (non-packed)
  * structs — see wal_types.h's header comment. Their sizeof() isn't
- * asserted here: the documented on-disk byte counts (44/36/48) are
+ * asserted here: the documented on-disk byte counts (44/24/48; the page
+ * header was 36, then 32) are
  * enforced by wal_segment.c's serialize/deserialize functions via
  * explicit offsets, not by struct layout. What's actually load-bearing
  * is the arithmetic relationship between the WAL_* size constants
@@ -30,8 +32,12 @@ static void test_size_constants(void)
     printf("\n[test_size_constants]\n");
     CHECK(WAL_PAGE_USABLE == WAL_PAGE_SIZE - WAL_PAGE_HEADER_SIZE,
           "WAL_PAGE_USABLE == WAL_PAGE_SIZE - WAL_PAGE_HEADER_SIZE");
-    CHECK(WAL_MAX_ROW_BODY == WAL_MAX_RECORD_SIZE - WAL_RECORD_HEADER_SIZE,
-          "WAL_MAX_ROW_BODY == WAL_MAX_RECORD_SIZE - WAL_RECORD_HEADER_SIZE");
+    /* (WAL_MAX_ROW_BODY == WAL_MAX_RECORD_SIZE - WAL_RECORD_HEADER_SIZE was
+     * checked here; both constants went with T-039 — records span pages.) */
+    CHECK(WAL_FIRST_RECORD_LSN == WAL_PAGE_SIZE + WAL_PAGE_HEADER_SIZE,
+          "WAL_FIRST_RECORD_LSN == segment page 0 + page 1's header");
+    CHECK(WAL_SEG_DATA_PAGES == WAL_SEG_SIZE / WAL_PAGE_SIZE - 1,
+          "WAL_SEG_DATA_PAGES == pages per segment minus the header page");
 }
 
 static void test_page_header_round_trip(void)
@@ -41,9 +47,9 @@ static void test_page_header_round_trip(void)
     memset(&hdr, 0, sizeof(hdr));
     hdr.id.file_type = FILETYPE_WAL_PAGE;
     hdr.start_lsn = 123456789ull;
-    hdr.data_len = 4000;
-    hdr.flags = 0x2;
-    hdr.end_lsn = 123456999ull;
+    hdr.continuation_len = 1234;
+    hdr.flags = WAL_PAGE_INCOMING_CONTINUATION;
+    hdr.reserved[0] = 0x5C;
 
     uint8_t buf[WAL_PAGE_HEADER_SIZE];
     wal_page_header_serialize(&hdr, buf);
@@ -56,9 +62,22 @@ static void test_page_header_round_trip(void)
     CHECK(out.id.magic == MYDB_MAGIC,        "magic round-trips");
     CHECK(out.id.file_type == FILETYPE_WAL_PAGE, "file_type round-trips");
     CHECK(out.start_lsn == hdr.start_lsn,    "start_lsn round-trips");
-    CHECK(out.data_len == hdr.data_len,      "data_len round-trips");
     CHECK(out.flags == hdr.flags,            "flags round-trips");
-    CHECK(out.end_lsn == hdr.end_lsn,        "end_lsn round-trips");
+    CHECK(out.continuation_len == hdr.continuation_len,      "continuation_len round-trips");
+    CHECK(out.reserved[0] == 0x5C,           "reserved[1] round-trips");
+
+    /* The on-disk layout, byte by byte: id 0-7, start_lsn 8-15,
+     * continuation_len 16-17, flags 18, reserved 19, CRC 20-23. (It was
+     * 32 bytes with data_len at 16-17 until data_len was dropped.) */
+    uint16_t cl;
+    uint64_t sl;
+    uint32_t cs;
+    memcpy(&sl, buf + 8, 8);
+    memcpy(&cl, buf + 16, 2);
+    memcpy(&cs, buf + 20, 4);
+    CHECK(sl == hdr.start_lsn && cl == 1234 && buf[18] == hdr.flags && buf[19] == 0x5C,
+          "fields sit at their documented offsets");
+    CHECK(cs == crc32(buf, 20), "the CRC at 20-23 covers bytes 0-19");
 }
 
 static void test_page_header_detects_tamper(void)
@@ -148,14 +167,15 @@ static void test_segment_header_detects_tamper(void)
 
 /* A record body far past WAL_MAX_ROW_BODY must round-trip. This used to
  * be impossible: serialize/deserialize copied header+body into a stack
- * scratch sized `40 + WAL_MAX_ROW_BODY`, so any LARGE_WAL-sized body
- * overran it. Both now fold the two spans in with crc32_update instead,
+ * scratch sized `40 + WAL_MAX_ROW_BODY` (4020; the constant is gone
+ * now), so any LARGE_WAL-sized body
+ * (or a record spanning pages) overran it. Both now fold the two spans in with crc32_update instead,
  * with no scratch and no size ceiling. */
 static void test_record_header_large_body(void)
 {
     printf("\n[test_record_header_large_body]\n");
 
-    size_t body_len = 400 * 1024;          /* ~100x WAL_MAX_ROW_BODY */
+    size_t body_len = 400 * 1024;          /* ~100x the old 4020-byte WAL_MAX_ROW_BODY */
     uint8_t *body = malloc(body_len);
     for (size_t i = 0; i < body_len; i++) body[i] = (uint8_t)(i & 0xFF);
 
@@ -180,8 +200,36 @@ static void test_record_header_large_body(void)
 
 /* patch_flags rewrites the flags byte of an already-serialized record
  * and recomputes its checksum, so the record still validates. This is
- * what lets the LARGE_WAL writer mark a record as spanning pages at
- * pack time without mutating the caller's const blob. */
+ * what let the LARGE_WAL writer mark a record as spanning pages at
+ * pack time without mutating the caller's const blob. Its only caller
+ * left with large_wal; whether it stays is decided in T-039. */
+/* pack writes the same 44 header bytes serialize does, without touching
+ * the body — the ring copies a spanning record's body in pieces. */
+static void test_record_header_pack(void)
+{
+    printf("\n[test_record_header_pack]\n");
+    uint8_t body[500];
+    for (size_t i = 0; i < sizeof(body); i++) body[i] = (uint8_t)(i * 3);
+
+    WalRecordHeader a, b;
+    memset(&a, 0, sizeof(a));
+    a.lsn = 777; a.txn_id = 9; a.rec_type = WAL_REC_INSERT;
+    a.total_len = WAL_RECORD_HEADER_SIZE + sizeof(body);
+    b = a;
+
+    uint8_t full[WAL_RECORD_HEADER_SIZE + sizeof(body)];
+    uint8_t packed[WAL_RECORD_HEADER_SIZE];
+    wal_record_header_serialize(&a, body, sizeof(body), full);
+    wal_record_header_pack(&b, body, sizeof(body), packed);
+    CHECK(memcmp(full, packed, WAL_RECORD_HEADER_SIZE) == 0, "pack's 44 bytes equal serialize's header");
+    CHECK(a.checksum == b.checksum, "both stamp the same checksum");
+
+    WalRecordHeader out;
+    memcpy(full, packed, WAL_RECORD_HEADER_SIZE);
+    CHECK(wal_record_header_deserialize(full, sizeof(body), &out) == MYDB_OK,
+          "a packed header followed by the body validates");
+}
+
 static void test_record_header_patch_flags(void)
 {
     printf("\n[test_record_header_patch_flags]\n");
@@ -224,6 +272,7 @@ int main(void)
 
     test_size_constants();
     test_record_header_large_body();
+    test_record_header_pack();
     test_record_header_patch_flags();
     test_page_header_round_trip();
     test_page_header_detects_tamper();

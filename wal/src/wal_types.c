@@ -1,4 +1,4 @@
-#include "normal_wal/wal_types.h"
+#include "wal_types.h"
 #include "checksum.h"
 
 #include <string.h>
@@ -15,11 +15,12 @@
  * spans that aren't adjacent in the final layout (the checksum field
  * itself sits between them, at offset 40). crc32_update lets us fold
  * both in without copying them into one scratch buffer first. The old
- * code did use a scratch, sized `40 + WAL_MAX_ROW_BODY` on the stack,
- * which silently capped body_len at normal_wal's 4020-byte limit —
- * LARGE_WAL records are precisely the ones that exceed it, so that
- * scratch was a stack overflow waiting for the first large record to
- * pass through here. */
+ * code did use a scratch, sized `40 + WAL_MAX_ROW_BODY` (4060, a constant
+ * since removed) on the stack,
+ * which silently capped body_len at the 4020-byte page limit —
+ * LARGE_WAL records (and now records that span pages) are precisely
+ * the ones that exceed it, so that scratch was a stack overflow waiting
+ * for the first large record to pass through here. */
 static uint32_t record_checksum(const uint8_t *hdr_buf, const void *body, size_t body_len)
 {
     uint32_t c = CRC32_INIT;
@@ -28,9 +29,10 @@ static uint32_t record_checksum(const uint8_t *hdr_buf, const void *body, size_t
     return crc32_final(c);
 }
 
-void wal_record_header_serialize(WalRecordHeader *hdr, const void *body,
-                                  size_t body_len, uint8_t *buf)
+void wal_record_header_pack(WalRecordHeader *hdr, const void *body,
+                             size_t body_len, uint8_t out[WAL_RECORD_HEADER_SIZE])
 {
+    uint8_t *buf = out;
     memcpy(buf + 0,  &hdr->lsn,       8);
     memcpy(buf + 8,  &hdr->prev_lsn,  8);
     memcpy(buf + 16, &hdr->total_len, 4);
@@ -40,11 +42,17 @@ void wal_record_header_serialize(WalRecordHeader *hdr, const void *body,
     buf[36] = hdr->rec_type;
     buf[37] = hdr->flags;
     memcpy(buf + 38, hdr->reserved,   2);
-    memcpy(buf + WAL_RECORD_HEADER_SIZE, body, body_len);
 
     uint32_t cs = record_checksum(buf, body, body_len);
     memcpy(buf + WAL_RECORD_HEADER_CHECKSUM_OFFSET, &cs, 4);
     hdr->checksum = cs;
+}
+
+void wal_record_header_serialize(WalRecordHeader *hdr, const void *body,
+                                  size_t body_len, uint8_t *buf)
+{
+    wal_record_header_pack(hdr, body, body_len, buf);
+    if (body_len) memcpy(buf + WAL_RECORD_HEADER_SIZE, body, body_len);
 }
 
 void wal_record_header_patch_flags(uint8_t *hdr_buf, const void *body,

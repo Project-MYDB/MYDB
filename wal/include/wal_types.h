@@ -38,8 +38,8 @@
 typedef struct {
     uint64_t lsn;              /* this record's LSN                       */
     uint64_t prev_lsn;         /* previous LSN for this txn (0 = first)   */
-    uint32_t total_len;        /* full record length including header     */
     uint64_t txn_id;
+    uint32_t total_len;        /* full record length including header     */
     uint32_t table_id;         /* persistent, on-disk-stable identifier   */
     uint32_t page_no;
     uint8_t  rec_type;         /* WalRecType, stored as a byte            */
@@ -49,12 +49,17 @@ typedef struct {
 } WalRecordHeader;
 
 /* Set when this record's bytes do not all fit on the page its header
- * landed on — the remainder continues on the next page. Only LARGE_WAL
- * ever sets it: normal_wal closes a frame rather than splitting a
- * record. Stamped by the LARGE_WAL writer at pack time (not by whoever
+ * landed on — the remainder continues on the next page. LARGE_WAL set
+ * it first (moved out of the tree); since T-039 wal_ring_buffer_append
+ * sets it, before packing the header, whenever a record's last byte
+ * lands on a later page than its first. It was stamped
+ * by the LARGE_WAL writer at pack time (not by whoever
  * built the record), because whether a record spans depends on where it
  * lands, which only the writer knows — see
- * wal_record_header_patch_flags below. */
+ * wal_record_header_patch_flags below. The ring buffer knows where a
+ * record lands before it packs the header, so it sets the flag directly
+ * and never needs patch_flags; the page header's OUT flag
+ * (WAL_PAGE_OUTGOING_CONTINUATION) carries the same fact page-side. */
 #define WAL_RECORD_FLAG_CONTINUES_ON_NEW_PAGE 0x01
 
 /* ------------------------------------------------------------------
@@ -66,16 +71,17 @@ typedef struct {
  * fixed bytes only), WalRecordHeader.checksum covers header AND body —
  * two regions that are not contiguous in the final on-disk layout
  * (checksum itself sits between them, at header offset 40). Both
- * functions build a small scratch buffer (header-minus-checksum ++
- * body) purely to compute one CRC32 over that combined span, then write
- * the real fixed layout (header incl. checksum at its own offset,
- * followed by body) into buf. buf must have room for
- * WAL_RECORD_HEADER_SIZE + body_len bytes; body_len must be <=
- * WAL_MAX_ROW_BODY (the scratch buffer is sized for the worst case).
+ * functions used to build a small scratch buffer (header-minus-checksum
+ * ++ body) to compute one CRC32 over that combined span; they now fold
+ * the two spans in with crc32_update (wal_types.c), so there is no
+ * scratch and no size ceiling. serialize writes the real fixed layout
+ * (header incl. checksum at its own offset, followed by body) into buf,
+ * which must have room for WAL_RECORD_HEADER_SIZE + body_len bytes.
  *
  * wal_record_header_serialize fills buf and stamps hdr->checksum too, so
- * callers who need to inspect what was written (e.g. to know a frame's
- * new end_lsn) can read it straight back off *hdr without re-parsing buf.
+ * callers who need to inspect what was written (e.g. its checksum or
+ * lsn; it used to be a frame's new end_lsn, a page header field dropped in
+ * T-039) can read it straight back off *hdr without re-parsing buf.
  * Caller sets every field of *hdr except checksum first.
  *
  * wal_record_header_deserialize validates the checksum before filling
@@ -83,6 +89,15 @@ typedef struct {
  * ------------------------------------------------------------------ */
 void wal_record_header_serialize(WalRecordHeader *hdr, const void *body,
                                   size_t body_len, uint8_t *buf);
+
+/* Writes only the 44-byte header into out, with the checksum computed
+ * over header + body, and stamps hdr->checksum. The body is read, never
+ * copied. This is what the ring buffer uses (T-039): a record that spans
+ * pages is never contiguous in the ring, so it packs the header here and
+ * then copies header and body piece by piece across frames.
+ * wal_record_header_serialize is this plus a memcpy of the body. */
+void wal_record_header_pack(WalRecordHeader *hdr, const void *body,
+                             size_t body_len, uint8_t out[WAL_RECORD_HEADER_SIZE]);
 int  wal_record_header_deserialize(const uint8_t *buf, size_t body_len,
                                     WalRecordHeader *out);
 
@@ -91,7 +106,8 @@ int  wal_record_header_deserialize(const uint8_t *buf, size_t body_len,
  * still validates afterwards. body must point at that record's own
  * contiguous body bytes (body_len of them); it is read, never written.
  *
- * This exists for the LARGE_WAL writer, which learns only at pack time
+ * This existed for the LARGE_WAL writer (moved out; no caller today;
+ * kept by decision in T-039), which learned only at pack time
  * whether a record will span a page, and must not mutate the caller's
  * const blob to record that: it patches a 44-byte copy of the header
  * and packs that instead of the original's first 44 bytes. */
@@ -114,18 +130,6 @@ typedef struct {
     uint64_t next_undo_lsn;
 } WalRecClrBody;
 
-/* WAL_REC_LARGE_REF body — corrected 2-field shape (impl doc §10.5), not
- * the design doc's original 5-field version (seg_no/start_page_no/
- * page_count/total_size dropped — LARGE_WAL-internal addressing details
- * that would go stale as the archiver relocates content; large_wal_get()
- * is the single mandated interface for resolving content location from
- * content_lsn alone). Field named lw_record_type (not record_type) to
- * avoid confusion with the enclosing WalRecordHeader.rec_type, which is
- * always WAL_REC_LARGE_REF for a record carrying this body. */
-typedef struct {
-    uint8_t  lw_record_type;   /* original type, e.g. WAL_REC_SCHEMA_UPDATE */
-    uint64_t content_lsn;       /* sole key — large_wal_get(content_lsn) resolves the rest */
-} WalRecLargeRefBody;
 
 /* WAL_REC_FILE_HEADER_UPDATE body — one of two field shapes,
  * discriminated by `field`. root_page_no now lives in RelationDef in

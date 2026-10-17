@@ -3,11 +3,12 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 
 #include "common.h"
 #include "wal_page.h"
-#include "normal_wal/wal_segment.h"
-#include "normal_wal/wal_segment_pool.h"
+#include "wal_segment.h"
+#include "wal_segment_pool.h"
 
 #define TEST_WAL_DIR "/tmp/mydb_test_wal_pool"
 
@@ -76,8 +77,10 @@ static void test_claim_next_round_robins(void)
         if (slot_index != i) { ok = 0; break; }
         if (pool.slots[slot_index].header.segment_no != i) { ok = 0; break; }
         if (pool.slots[slot_index].header.state != SEG_ACTIVE) { ok = 0; break; }
+        if (pool.slots[slot_index].header.start_lsn != wal_segment_first_lsn(i)) { ok = 0; break; }
     }
-    CHECK(ok, "10 successive claims assign slot_index == segment_no == 0..9 in order");
+    CHECK(ok, "10 successive claims assign slot_index == segment_no == 0..9 in order, "
+              "each stamped with start_lsn = its first record's LSN");
 
     uint32_t eleventh;
     int rc = wal_segment_pool_claim_next(&pool, &eleventh);
@@ -102,7 +105,7 @@ static void test_page_round_trip_and_bounds(void)
     memset(&hdr, 0, sizeof(hdr));
     hdr.id.file_type = FILETYPE_WAL_PAGE;
     hdr.start_lsn = 99;
-    hdr.data_len = 123;
+    hdr.continuation_len = 123;   /* (was data_len, dropped from the page header) */
 
     uint8_t page_buf[WAL_PAGE_SIZE];
     memset(page_buf, 0, WAL_PAGE_SIZE);
@@ -203,14 +206,13 @@ static void test_crash_reload_tail_scan(void)
  * the way the Flusher would before handing it to wal_segment_pool_write
  * — segment_write itself never constructs headers, so tests that need
  * a real one build it by hand via the existing wal_page_* functions. */
-static void build_page(uint8_t *out, uint64_t start_lsn, uint64_t end_lsn, uint8_t fill)
+static void build_page(uint8_t *out, uint64_t start_lsn, uint8_t fill)
 {
     WalPageHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.id.file_type = FILETYPE_WAL_PAGE;
-    hdr.start_lsn = start_lsn;
-    hdr.end_lsn = end_lsn;
-    hdr.data_len = WAL_PAGE_USABLE;
+    hdr.start_lsn = start_lsn;   /* the page's own position in the log (T-039) */
+    /* (end_lsn, and later data_len, were set here; both are gone) */
     memset(out + WAL_PAGE_HEADER_SIZE, fill, WAL_PAGE_USABLE);
     wal_page_header_serialize(&hdr, out);
 }
@@ -307,18 +309,21 @@ static void test_write_rolls_to_new_segment(void)
     uint32_t page_no = 1, offset = 0;
     uint32_t first_slot = slot_index;
 
-    /* Build all 511 usable pages as real, header-carrying pages — the
-     * last one (page 511) stamped with a distinguishable end_lsn — plus
-     * one more real page that should land in the rolled-over segment.
-     * This is the one scenario that needs real headers: it's testing
-     * that wal_segment_pool_write correctly reads end_lsn back from the
-     * segment's true last page when it auto-finalizes. */
+    /* Build all 511 usable pages as real, header-carrying pages, each
+     * stamped with its own position in segment 0 — plus one more real page
+     * that should land in the rolled-over segment. This is the one
+     * scenario that needs real headers: it's testing that
+     * wal_segment_pool_write works out the segment's end from its true
+     * last page when it auto-finalizes (start_lsn + WAL_PAGE_SIZE; it used
+     * to read that page's end_lsn field, dropped in T-039, and then add
+     * data_len, dropped after it). The last page used to hold 4000 bytes
+     * so the end was not just "the page end"; every page is full now. */
     uint32_t last_page_count = WAL_SEGMENT_PAGES_PER_FILE - 1;
     size_t total_len = (size_t)WAL_PAGE_SIZE * (last_page_count + 1);
     uint8_t *big = malloc(total_len);
     for (uint32_t i = 0; i < last_page_count; i++)
-        build_page(big + (size_t)i * WAL_PAGE_SIZE, 100 + i, 12345, 0x5A);
-    build_page(big + (size_t)last_page_count * WAL_PAGE_SIZE, 200, 999, 0x5B);
+        build_page(big + (size_t)i * WAL_PAGE_SIZE, (uint64_t)(i + 1) * WAL_PAGE_SIZE, 0x5A);
+    build_page(big + (size_t)last_page_count * WAL_PAGE_SIZE, WAL_SEG_SIZE + WAL_PAGE_SIZE, 0x5B);
 
     int rc = wal_segment_pool_write(&pool, NULL, &slot_index, &page_no, &offset, big, total_len);
     CHECK(rc == MYDB_OK, "a write that fills the whole segment and spills one page over succeeds");
@@ -330,8 +335,9 @@ static void test_write_rolls_to_new_segment(void)
           "the filled segment was finalized to SEG_DONE automatically");
     CHECK(pool.slots[first_slot].header.data_pages == last_page_count,
           "the finalized segment's data_pages reflects all 511 pages used");
-    CHECK(pool.slots[first_slot].header.end_lsn == 12345,
-          "the finalized segment's end_lsn was read back from the true last page's own end_lsn field");
+    CHECK(pool.slots[first_slot].header.end_lsn == 511ull * WAL_PAGE_SIZE + WAL_PAGE_SIZE &&
+          pool.slots[first_slot].header.end_lsn == WAL_SEG_SIZE,
+          "the finalized segment's end_lsn = its last page's start_lsn + WAL_PAGE_SIZE (segment 1's start)");
     CHECK(pool.slots[slot_index].header.state == SEG_ACTIVE,
           "the new segment is active and holds the one spilled-over page");
 
@@ -342,6 +348,45 @@ static void test_write_rolls_to_new_segment(void)
 
     free(big);
     wal_segment_pool_shutdown(&pool);
+    cleanup();
+}
+
+/* T-010: a slot that was claimed once and later freed keeps segment_no
+ * and start_lsn in its FREE header, and init counts it when reseeding
+ * next_segment_no — so the counter never drops back, even when every
+ * slot is FREE. (No free path exists yet; the FREE header is written by
+ * hand here, the way the future free path must write it.) */
+static void test_reseed_counts_freed_slots(void)
+{
+    printf("\n[test_reseed_counts_freed_slots]\n");
+    cleanup();
+
+    WalSegmentPool pool;
+    wal_segment_pool_init(&pool, TEST_WAL_DIR, 1);
+    wal_segment_pool_shutdown(&pool);
+
+    WalSegmentHeader h;
+    memset(&h, 0, sizeof(h));
+    h.id.file_type = FILETYPE_WAL_SEGMENT;
+    h.segment_no   = 27;                          /* lives in slot 27 % 10 = 7 */
+    h.start_lsn    = wal_segment_first_lsn(27);
+    h.partition_id = 1;
+    h.state        = SEG_FREE;
+    uint8_t page[WAL_PAGE_SIZE];
+    memset(page, 0, sizeof(page));
+    wal_segment_header_serialize(&h, page);
+    char path[300];
+    snprintf(path, sizeof(path), "%s/wal_7.mydb", TEST_WAL_DIR);
+    int fd = open(path, O_WRONLY);
+    CHECK(fd >= 0 && pwrite(fd, page, WAL_PAGE_SIZE, 0) == WAL_PAGE_SIZE, "a freed segment 27's header is on disk");
+    if (fd >= 0) close(fd);
+
+    WalSegmentPool reloaded;
+    CHECK(wal_segment_pool_init(&reloaded, TEST_WAL_DIR, 1) == MYDB_OK, "reload succeeds");
+    CHECK(reloaded.slots[7].header.state == SEG_FREE, "every slot is FREE");
+    CHECK(reloaded.next_segment_no == 28, "next_segment_no continues after 27 instead of restarting at 0");
+
+    wal_segment_pool_shutdown(&reloaded);
     cleanup();
 }
 
@@ -359,6 +404,7 @@ int main(void)
     test_write_at_explicit_offset();
     test_write_spans_multiple_pages();
     test_write_rolls_to_new_segment();
+    test_reseed_counts_freed_slots();
 
     printf("\nResults: %d/%d passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

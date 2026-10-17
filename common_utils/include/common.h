@@ -22,11 +22,14 @@
 /*  themselves, which are wal/'s own structs, not declared here.      */
 /* ------------------------------------------------------------------ */
 #define WAL_PAGE_SIZE           4096
-#define WAL_PAGE_HEADER_SIZE      32   /* was 36 -- WalPageHeader unified/shrunk */
+#define WAL_PAGE_HEADER_SIZE      24   /* was 32 (36 before that) -- data_len and 6 reserved
+                                         bytes dropped from WalPageHeader in T-039 */
 #define WAL_RECORD_HEADER_SIZE    44
-#define WAL_PAGE_USABLE         4064   /* was 4060 -- WAL_PAGE_SIZE - WAL_PAGE_HEADER_SIZE */
-#define WAL_MAX_RECORD_SIZE     4064   /* was 4060 -- records above this redirect to LARGE_WAL */
-#define WAL_MAX_ROW_BODY        4020   /* was 4016 -- WAL_MAX_RECORD_SIZE - WAL_RECORD_HEADER_SIZE */
+#define WAL_PAGE_USABLE         4072   /* WAL_PAGE_SIZE - WAL_PAGE_HEADER_SIZE (was 4064, 4060 before that) */
+/* WAL_MAX_RECORD_SIZE (4064, was 4060 -- records above it used to redirect
+ * to LARGE_WAL) and WAL_MAX_ROW_BODY (4020, was 4016 -- WAL_MAX_RECORD_SIZE -
+ * WAL_RECORD_HEADER_SIZE) were removed with T-039: records span pages and
+ * segments now, so the only limit on a record is the ring buffer's size. */
 
 /* ------------------------------------------------------------------ */
 /*  Size limits                                                       */
@@ -66,6 +69,8 @@
 #define FILETYPE_STATS               7   /* __stats.mydb           — CBO optimizer stats */
 #define FILETYPE_WAL_PAGE            8   /* wal/wal_<N>.mydb page format */
 #define FILETYPE_WAL_SEGMENT         9   /* wal/wal_<N>.mydb segment header */
+/* 10-13 belonged to large_wal, moved out to ../large_wal_stash. Kept
+ * defined so the numbers are never handed to another file type. */
 #define FILETYPE_LARGE_WAL_PAGE     10   /* large_wal/lw_<N>.mydb page format */
 #define FILETYPE_LARGE_WAL_SEGMENT  11   /* large_wal/lw_<N>.mydb segment header */
 #define FILETYPE_LARGE_WAL_INDEX    12   /* wal/large_wal_index.mydb */
@@ -186,8 +191,7 @@ typedef enum {
     WAL_REC_FILE_CREATE        = 13,
     WAL_REC_FILE_DROP          = 14,
     WAL_REC_CHECKPOINT         = 15,
-    WAL_REC_CLR                = 16,
-    WAL_REC_LARGE_REF          = 17  /* pointer to LARGE_WAL segment */
+    WAL_REC_CLR                = 16
 } WalRecType;
 
 /* ------------------------------------------------------------------ */

@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "common.h"
-#include "normal_wal/wal_segment.h"
+#include "wal_segment.h"
 #include "wal_worker.h"
 
 /*
@@ -36,7 +36,7 @@
  *     for the next one. This module only supplies those primitives; the
  *     rollover *decision* and cursor bookkeeping belong to the Flusher
  *     phase, not here.
- *   - The Normal WAL Archiver (design doc §7) calls
+ *   - The WAL Archiver (design doc §7's "Normal WAL Archiver") calls
  *     wal_segment_pool_read_segment() to get a whole segment's raw bytes
  *     in one call ("COPY PHASE: stream segment -> tmp/tmp_seg_<N>.mydb"
  *     copies the entire file, not page-by-page).
@@ -64,13 +64,22 @@ typedef struct {
 } WalSlot;
 
 /* ------------------------------------------------------------------
- * WalSegmentPool — one per partition's normal_wal. next_segment_no is
+ * WalSegmentPool — one per partition's WAL. next_segment_no is
  * the pool-level monotonic counter driving claim_next()'s segment_no
  * assignment (see wal_segment_pool.c for the full reasoning: this phase
  * only exercises SEG_FREE -> SEG_ACTIVE, so numbers are assigned at
  * claim time from one shared counter rather than the design doc's
  * Archiver-driven free-time stamping, which needs a thread this phase
  * doesn't build yet).
+ *
+ * Since T-039 a segment number is part of the LSN (segment N covers LSN
+ * [N * 2MB, (N+1) * 2MB)), so it must never go backwards: two segments
+ * with one number would claim the same LSNs. claim_next stamps start_lsn
+ * = wal_segment_first_lsn(segment_no), so start_lsn != 0 marks "this slot
+ * was claimed at least once", and init reseeds next_segment_no from every
+ * such slot, FREE ones included (T-010). Whoever adds the free path (the
+ * WAL Archiver / recycling) must keep segment_no and start_lsn in the
+ * FREE header it writes, or the counter can drop back again.
  * ------------------------------------------------------------------ */
 typedef struct {
     char      wal_dir[256];
@@ -94,7 +103,8 @@ int wal_segment_pool_init(WalSegmentPool *pool, const char *wal_dir, uint32_t pa
 int wal_segment_pool_shutdown(WalSegmentPool *pool);
 
 /* SEG_FREE -> SEG_ACTIVE: claims slot (next_segment_no %
- * WAL_SEGMENT_POOL_SLOTS), stamps its segment_no, rewrites the header.
+ * WAL_SEGMENT_POOL_SLOTS), stamps its segment_no and start_lsn
+ * (wal_segment_first_lsn(segment_no)), rewrites the header.
  * *out_slot_index names the claimed slot. Returns MYDB_ERR if that slot
  * isn't currently SEG_FREE (expected once all 10 slots have been
  * claimed once and none has been freed yet — freeing is a later
@@ -151,11 +161,12 @@ int wal_segment_pool_read_page(WalSegmentPool *pool, uint32_t slot_index,
  * next one. The one exception to "never reads header content": right
  * before finalizing, reads the just-filled last page back
  * (wal_segment_pool_read_page + wal_page_header_deserialize) purely to
- * copy its end_lsn field into mark_done()'s end_lsn argument — the only
- * reliable source for a segment's true highest LSN, since start_lsn alone
- * is only the *first* record's LSN, not the last (see wal_page.h's
- * end_lsn field comment). This is a field copy, not content
- * interpretation. Returns MYDB_ERR if claim_next fails mid-write (pool
+ * work out mark_done()'s end_lsn argument: that page's start_lsn +
+ * WAL_PAGE_SIZE, the end of its data, since every page the Flusher
+ * writes is full. (It used to copy the page's own end_lsn field, which
+ * wal_page.h dropped in T-039: with the LSN a position, a page's end
+ * needs no field. For a while after that it added data_len, also
+ * dropped.) A field read and an addition, not content interpretation. Returns MYDB_ERR if claim_next fails mid-write (pool
  * exhausted).
  *
  * TEMPORARY: fdatasyncs before returning on every call — the Flusher
@@ -204,8 +215,8 @@ int wal_segment_pool_mark_done(WalSegmentPool *pool, WalWorker *worker,
                                uint64_t *out_ticket);
 
 /* Reads a whole segment file's raw WAL_SEGMENT_FILE_SIZE bytes (header
- * page-slot included) into out_buf in one call — the Normal WAL
- * Archiver's COPY PHASE copies the entire file, not page-by-page (design
+ * page-slot included) into out_buf in one call — the WAL Archiver's
+ * COPY PHASE copies the entire file, not page-by-page (design
  * doc §7). out_buf must have room for WAL_SEGMENT_FILE_SIZE bytes. */
 int wal_segment_pool_read_segment(WalSegmentPool *pool, uint32_t slot_index,
                                    uint8_t *out_buf);
@@ -218,12 +229,13 @@ int wal_segment_pool_read_segment(WalSegmentPool *pool, uint32_t slot_index,
  *
  * Sound here only because this pool has no free/reuse path yet: a slot
  * is claimed once and never released, so a page can never hold a
- * previous generation's content. Whoever adds one (the Normal WAL
- * Archiver) MUST zero a slot's content pages before releasing it —
+ * previous generation's content. Whoever adds one (the WAL Archiver)
+ * MUST zero a slot's content pages before releasing it —
  * stale pages deserialize perfectly well, so this walk would run past
  * the live tail and report the older segment's count. large_wal hit
  * exactly that; see large_wal_segment_pool_free_slot for the fix and
- * the write-ordering it needs. */
+ * the write-ordering it needs (moved out with large_wal, in
+ * ../large_wal_stash, and in git history at 513e5d4). */
 int wal_segment_pool_tail_scan(WalSegmentPool *pool, uint32_t slot_index,
                                 uint32_t *out_data_pages);
 

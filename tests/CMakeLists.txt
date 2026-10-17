@@ -19,89 +19,16 @@ foreach(mod ${STORAGE_ONLY_TEST_MODULES})
     add_test(NAME test_${mod} COMMAND test_${mod})
 endforeach()
 
-# WAL — normal_wal's on-disk struct layer (record/page/segment header
+# WAL — the on-disk struct layer (record/page/segment header
 # format + checksum). Skeleton only this phase: no file I/O, no ring
 # buffer, no threads (see MYDB_WAL_IMPLEMENTATION.md §8).
 add_executable(test_wal_types wal/test_wal_types.c)
 target_link_libraries(test_wal_types PRIVATE wal)
 add_test(NAME test_wal_types COMMAND test_wal_types)
 
-# large_wal Phase 1 — on-disk struct layer only (page/segment header
-# format + checksum), mirroring normal_wal's own Phase 1 exactly
-# (MYDB_WAL_IMPLEMENTATION.md §10).
-add_executable(test_large_wal_types wal/test_large_wal_types.c)
-target_link_libraries(test_large_wal_types PRIVATE wal)
-add_test(NAME test_large_wal_types COMMAND test_large_wal_types)
-
-# large_wal Phase 2 — the 4-slot rotation pool of large_wal_<N>.mydb
-# segment files (MYDB_WAL_IMPLEMENTATION.md §10.1). Real file I/O under
-# /tmp; no copy-out/holding-area yet — "archive section" phase next.
-add_executable(test_large_wal_segment_pool wal/test_large_wal_segment_pool.c)
-target_link_libraries(test_large_wal_segment_pool PRIVATE wal)
-add_test(NAME test_large_wal_segment_pool COMMAND test_large_wal_segment_pool)
-
-# large_wal Phase 3 — the archive section: large_wal_index.mydb (content_lsn
-# -> segment location) and the archiver (rotation-pool copy-out to the
-# holding area, large_wal_get resolution, Gate A/B freeing). Real file I/O
-# under /tmp. (MYDB_WAL_IMPLEMENTATION.md §10.1/§10.6).
-add_executable(test_large_wal_index wal/test_large_wal_index.c)
-target_link_libraries(test_large_wal_index PRIVATE wal)
-add_test(NAME test_large_wal_index COMMAND test_large_wal_index)
-
-add_executable(test_large_wal_archiver wal/test_large_wal_archiver.c)
-target_link_libraries(test_large_wal_archiver PRIVATE wal)
-add_test(NAME test_large_wal_archiver COMMAND test_large_wal_archiver)
-
-# large_wal Phase 4 — the static staging buffer (MYDB_WAL_IMPLEMENTATION.md
-# §10.10): static-vs-heap sizing only, no page framing (deferred to the
-# writer-thread phase — see the plan).
-add_executable(test_large_wal_buffer wal/test_large_wal_buffer.c)
-target_link_libraries(test_large_wal_buffer PRIVATE wal)
-add_test(NAME test_large_wal_buffer COMMAND test_large_wal_buffer)
-
-# large_wal Phase 5 — large_wal_state.mydb (flush_lsn watermark, §10.9)
-# and the large_wal_writer thread (Appendix A): segment-fit check,
-# header stamping, one byte-for-byte segment write, index insert, and
-# widening the archiver's registry to cover claim_next() onward.
-add_executable(test_large_wal_state wal/test_large_wal_state.c)
-target_link_libraries(test_large_wal_state PRIVATE wal)
-add_test(NAME test_large_wal_state COMMAND test_large_wal_state)
-
-add_executable(test_large_wal_writer wal/test_large_wal_writer.c)
-target_link_libraries(test_large_wal_writer PRIVATE wal)
-add_test(NAME test_large_wal_writer COMMAND test_large_wal_writer)
-
-# (segment_no -> fd) table extracted out of large_wal_archiver once
-# large_wal_writer started registering into it too -- shared
-# infrastructure, not archiver-owned.
-add_executable(test_large_wal_registry wal/test_large_wal_registry.c)
-target_link_libraries(test_large_wal_registry PRIVATE wal)
-add_test(NAME test_large_wal_registry COMMAND test_large_wal_registry)
-
-# large_wal_manager (lifecycle/ownership, mirrors PartitionCtx) +
-# large_wal_api (external contract + large_wal_get's real logic, mirrors
-# pm_api.h) -- exercised together since large_wal_get/write only make
-# sense against a fully brought-up LargeWalManager.
-add_executable(test_large_wal_manager wal/test_large_wal_manager.c)
-target_link_libraries(test_large_wal_manager PRIVATE wal)
-add_test(NAME test_large_wal_manager COMMAND test_large_wal_manager)
-
-# large_wal segment locking -- the only test that runs more than one
-# thread against large_wal. Readers race the writer, readers race the
-# archiver relocating and deleting segments underneath them, and the
-# registry/index are hammered directly. Passing here is necessary but not
-# sufficient: the real verification is a clean run under
-# -DMYDB_SANITIZE_THREAD=ON (see the file's own header comment).
-#
-# Extended when the archiver thread landed: the hand-rolled driver this
-# file used to run was replaced by the real large_wal_archiver thread,
-# and it now also covers claim_next_wait's two outcomes (wakes on a
-# free / times out), the Gate A+B provider actually driving try_free,
-# and a restart re-registering holding-area files (including deleting a
-# truncated one so copy_out's O_EXCL can create it again).
-add_executable(test_large_wal_concurrency wal/test_large_wal_concurrency.c)
-target_link_libraries(test_large_wal_concurrency PRIVATE wal Threads::Threads)
-add_test(NAME test_large_wal_concurrency COMMAND test_large_wal_concurrency)
+# The large_wal tests (Phases 1-5, the registry, the manager and the
+# concurrency test) and the old test_wal_manager moved out with their code to
+# ../large_wal_stash (tests_CMakeLists_fragment.txt holds their blocks).
 
 # WAL Phase 2 — the pool of 10 physical wal_<N>.mydb segment files:
 # pre-allocation, round-robin claiming, raw page I/O, crash-reload
@@ -123,8 +50,8 @@ target_link_libraries(test_wal_flusher PRIVATE wal)
 add_test(NAME test_wal_flusher COMMAND test_wal_flusher)
 
 # wal_mailbox — the shared background-thread + request/response queue
-# that wal_worker and LargeWalWriter's submit() were both hand-written
-# copies of. Tests the four rules its header now owns: the depth slot
+# that wal_worker and LargeWalWriter's submit() (large_wal, now moved out)
+# were both hand-written copies of. Tests the four rules its header now owns: the depth slot
 # comes back on collect (not on handler completion), a queued request is
 # still served during shutdown, waiting on an unposted node is a no-op,
 # and two callers in flight each collect their own result.
@@ -139,17 +66,10 @@ add_executable(test_wal_worker wal/test_wal_worker.c)
 target_link_libraries(test_wal_worker PRIVATE wal)
 add_test(NAME test_wal_worker COMMAND test_wal_worker)
 
-# normal_wal_manager (lifecycle/ownership, mirrors LargeWalManager): owns
-# WalRingBuffer + WalSegmentPool + WalFlusher, one init() call brings all
-# three up together.
-add_executable(test_normal_wal_manager wal/test_normal_wal_manager.c)
-target_link_libraries(test_normal_wal_manager PRIVATE wal)
-add_test(NAME test_normal_wal_manager COMMAND test_normal_wal_manager)
-
-# wal_manager — top-level, sibling to normal_wal/ and large_wal/: owns
-# the one shared WalWorker + both subsystems' own managers. NOT the
-# TxnManager->wal_manager routing/dispatch layer (still deferred) —
-# purely "owns the shared worker + both sub-managers."
+# wal_manager (lifecycle/ownership; was normal_wal_manager, which mirrored
+# LargeWalManager, merged with the old top-level wal_manager): owns
+# WalWorker + WalRingBuffer + WalSegmentPool + WalFlusher, one init() call
+# brings all four up together.
 add_executable(test_wal_manager wal/test_wal_manager.c)
 target_link_libraries(test_wal_manager PRIVATE wal)
 add_test(NAME test_wal_manager COMMAND test_wal_manager)

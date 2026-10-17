@@ -13,7 +13,9 @@
  *
  * This file exists because wal/ had grown two hand-written copies of the
  * same thing. wal_worker.h said so itself: "Single-slot mailbox, same
- * mutex+condvar shape LargeWalWriter's submit() already uses." Same
+ * mutex+condvar shape LargeWalWriter's submit() already uses." (large_wal,
+ * and with it LargeWalWriter, has since been moved out of the tree;
+ * wal_worker is the one user left.) Same
  * thread loop, same start/stop, same idle gate, same three-flag
  * handshake — written twice, so any fix had to be applied twice and
  * stay applied. The tricky parts (below) now live in one place.
@@ -117,8 +119,9 @@
  * ------------------------------------------------------------------
  */
 
-/* Biggest request a mailbox will carry. 64 bytes covers both users
- * today (an int fd; LargeWalWriter's five-field submit descriptor) with
+/* Biggest request a mailbox will carry. 64 bytes covered both users it
+ * was sized for (an int fd; LargeWalWriter's five-field submit
+ * descriptor, gone with large_wal) with
  * room to spare, and keeps a node small enough to sit on a stack
  * without thought. post() rejects anything larger rather than
  * truncating. */

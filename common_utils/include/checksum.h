@@ -47,7 +47,7 @@ uint32_t crc32(const void *data, size_t len);
 /*  not adjacent on disk (the checksum field itself sits between       */
 /*  them). Copying both into a stack scratch — the old approach —      */
 /*  bounded record bodies to the scratch's size, which LARGE_WAL       */
-/*  records exceed by definition.                                      */
+/*  records exceeded by definition, as records spanning pages will.    */
 /* ------------------------------------------------------------------ */
 #define CRC32_INIT 0xFFFFFFFFu
 

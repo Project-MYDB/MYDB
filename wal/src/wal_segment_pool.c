@@ -1,6 +1,9 @@
-#include "normal_wal/wal_segment_pool.h"
+#include "wal_segment_pool.h"
 #include "wal_page.h"
 #include "common.h"
+
+/* wal_page.h's LSN arithmetic assumes the segment size this pool uses. */
+_Static_assert(WAL_SEG_SIZE == WAL_SEGMENT_FILE_SIZE, "WAL_SEG_SIZE must match WAL_SEGMENT_FILE_SIZE");
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -161,11 +164,15 @@ int wal_segment_pool_init(WalSegmentPool *pool, const char *wal_dir, uint32_t pa
     /* Reseed the shared claim counter from whatever's on disk — see
      * wal_segment_pool.h's header comment for why this scheme (one
      * pool-level counter, assigned at claim time) stands in for the
-     * design doc's Archiver-driven free-time stamping. */
+     * design doc's Archiver-driven free-time stamping. Counts every slot
+     * that was ever claimed (start_lsn != 0), FREE included, not just the
+     * non-FREE ones: the segment number is part of the LSN, so it must
+     * never drop back (T-010). */
     uint64_t max_used = 0;
     int      any_used = 0;
     for (uint32_t i = 0; i < WAL_SEGMENT_POOL_SLOTS; i++) {
-        if (pool->slots[i].header.state != SEG_FREE) {
+        if (pool->slots[i].header.state != SEG_FREE ||
+            pool->slots[i].header.start_lsn != 0) {
             if (!any_used || pool->slots[i].header.segment_no > max_used)
                 max_used = pool->slots[i].header.segment_no;
             any_used = 1;
@@ -208,7 +215,7 @@ int wal_segment_pool_claim_next(WalSegmentPool *pool, uint32_t *out_slot_index)
      * write has actually succeeded. */
     WalSegmentHeader next = slot->header;
     next.segment_no   = pool->next_segment_no;
-    next.start_lsn    = 0;
+    next.start_lsn    = wal_segment_first_lsn(pool->next_segment_no);   /* T-039 */
     next.end_lsn      = 0;
     next.data_pages   = 0;
     next.state        = SEG_ACTIVE;
@@ -362,17 +369,18 @@ int wal_segment_pool_write(WalSegmentPool *pool, WalWorker *worker,
 
         if (*page_no + 1 >= WAL_SEGMENT_PAGES_PER_FILE) {
             /* The segment is full too. The one non-"blind" step: read
-             * the page we just filled back and copy its own end_lsn
-             * field — the only reliable source for the segment's true
-             * highest LSN, since start_lsn alone is only the first
-             * record's LSN, not the last (wal_page.h). A field copy,
-             * not content interpretation. */
+             * the page we just filled back and work out where its data
+             * ends — start_lsn + WAL_PAGE_SIZE, since every page the
+             * Flusher writes is full. (It used to copy the page's own
+             * end_lsn field, dropped in T-039, and then add data_len,
+             * dropped after it; see wal_page.h.) A field read, not
+             * content interpretation. */
             uint8_t  last_page[WAL_PAGE_SIZE];
             uint64_t seg_end_lsn = 0;
             if (wal_segment_pool_read_page(pool, *slot_index, *page_no, last_page) == MYDB_OK) {
                 WalPageHeader hdr;
                 if (wal_page_header_deserialize(last_page, &hdr) == MYDB_OK)
-                    seg_end_lsn = hdr.end_lsn;
+                    seg_end_lsn = hdr.start_lsn + WAL_PAGE_SIZE;
             }
 
             uint32_t finished_slot       = *slot_index;

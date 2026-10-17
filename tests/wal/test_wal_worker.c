@@ -91,9 +91,10 @@ static void test_back_to_back_submissions(void)
 }
 
 /* ------------------------------------------------------------------
- * One worker, two caller threads -- the real shape in production: the
- * Flusher thread and the LargeWalWriter thread share one WalWorker
- * (wal_manager.h), and BOTH call wait() unconditionally at the end of
+ * One worker, two caller threads -- the shape production had while
+ * large_wal existed (the Flusher thread and the LargeWalWriter thread
+ * shared one WalWorker), and the one any second caller brings back.
+ * BOTH call wait() unconditionally at the end of
  * every write(), whether or not that particular call rolled over and
  * posted anything.
  *
