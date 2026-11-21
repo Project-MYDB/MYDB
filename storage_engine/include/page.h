@@ -31,7 +31,7 @@
 /*  Page header — 38 bytes at offset 0                                 */
 /* ------------------------------------------------------------------ */
 typedef struct {
-    uint32_t checksum;       /* FNV-1a checksum over bytes [4 .. PAGE_SIZE-9] */
+    uint32_t checksum;       /* CRC-32C checksum over bytes [4 .. PAGE_SIZE-9] */
     uint32_t page_no;        /* this page's number in the file */
     uint32_t prev_page;      /* previous leaf page (doubly-linked leaf chain) */
     uint32_t next_page;      /* next leaf page */
@@ -151,7 +151,7 @@ void rec_hdr_encode(const RecordHeader *rh, uint8_t *dst);
 void rec_hdr_decode(const uint8_t *src, RecordHeader *rh);
 
 /*
- * Compute and write the FNV-1a checksum for the page.
+ * Compute and write the CRC-32C checksum for the page.
  * Call this before writing a page to disk.
  */
 void page_set_checksum(uint8_t *page);

@@ -10,7 +10,7 @@
 /*  One file per schema, ~1 MB fixed (SCHEMA_FILE_PAGES x PAGE_SIZE). */
 /*                                                                    */
 /*    Page 0          : SchemaHeader + RelationEntry slot directory   */
-/*                      + FNV-1a checksum trailer                     */
+/*                      + CRC-32C checksum trailer                    */
 /*    Pages 1..64     : one full serialized RelationDef per page,     */
 /*                      allocated on demand                           */
 /*                                                                    */

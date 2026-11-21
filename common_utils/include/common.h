@@ -54,8 +54,11 @@
 /* ------------------------------------------------------------------ */
 /*  On-disk format version. Bumped when any file layout changes in    */
 /*  a way that older binaries can't read.                             */
+/*  3: every checksum (data pages and metadata-file trailers) moved   */
+/*  from FNV-1a to CRC-32C, so files written by version 2 fail their  */
+/*  checksum and are refused by the version check first.              */
 /* ------------------------------------------------------------------ */
-#define MYDB_FORMAT_VERSION  2
+#define MYDB_FORMAT_VERSION  3
 
 /* ------------------------------------------------------------------ */
 /*  v2 four-level hierarchy capacities                                */

@@ -25,7 +25,7 @@ extern "C" {
  *   Bytes  8..11  : slot_idx      (uint32, LE)
  *   Bytes 12..15  : blob_used     (uint32, LE — bytes consumed in blob pool)
  *   Bytes 16..2063: ColumnStats[MAX_COLUMNS] (32 × 64 = 2048 B, raw)
- *   Bytes 2064..2067: FNV-1a checksum over bytes 0..2063
+ *   Bytes 2064..2067: CRC-32C checksum over bytes 0..2063
  *   Bytes 2068..2071: padding (to align blob pool to 8 B)
  *   Bytes 2072..16383: blob pool (14312 B — MCV/histogram entries)
  *
@@ -53,7 +53,7 @@ extern "C" {
 #define STATS_REL_SLOT_OFF    8     /* slot_idx:  4 B at offset 8            */
 #define STATS_REL_BLOB_USED   12    /* blob_used: 4 B at offset 12           */
 #define STATS_REL_COLS_OFF    16    /* ColumnStats array: bytes 16..2063     */
-#define STATS_REL_CKSUM_OFF   2064  /* FNV-1a checksum: 4 B at offset 2064  */
+#define STATS_REL_CKSUM_OFF   2064  /* CRC-32C checksum: 4 B at offset 2064 */
 #define STATS_BLOB_START      2072  /* blob pool: 8-byte aligned start       */
 #define STATS_BLOB_POOL_SIZE  (PAGE_SIZE - STATS_BLOB_START)  /* 14312 B    */
 #define STATS_BLOB_POOL_WORDS (STATS_BLOB_POOL_SIZE / 8)      /* 1789       */
