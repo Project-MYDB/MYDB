@@ -1,3 +1,9 @@
+# common_utils — shared helpers every module uses (checksum, file_header,
+# crypto). test_checksum covers CRC-32C.
+add_executable(test_checksum common_utils/test_checksum.c)
+target_link_libraries(test_checksum PRIVATE common_utils)
+add_test(NAME test_checksum COMMAND test_checksum)
+
 # Pure storage_engine modules (stateless I/O layer).
 set(STORAGE_ONLY_TEST_MODULES
     disk_manager page buffer_pool btree file_header relation_def)

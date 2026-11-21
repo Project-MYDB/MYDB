@@ -24,7 +24,7 @@
 /*    128..3711 : 64 x RelationEntry, 56 B each                       */
 /*    3712..16367: reserved (12656 B)                                 */
 /*    16368..16375: reserved (8 B)                                    */
-/*    16376..16379: FNV-1a checksum over bytes 0..16375 (4 B)         */
+/*    16376..16379: CRC-32C checksum over bytes 0..16375 (4 B)        */
 /*    16380..16383: reserved (4 B)                                    */
 /*                                                                    */
 /*  RelationEntry on-disk (56 B per slot, per design §8.2):           */
@@ -385,7 +385,7 @@ static void pack_page0(const SchemaFile *sf, uint8_t *buf)
             buf + SF_RELATION_OFFSET + i * SF_RELATION_SIZE,
             &sf->relations[i]);
     }
-    uint32_t cs = fnv1a(buf, SF_CHECKSUM_OFFSET);
+    uint32_t cs = crc32c(buf, SF_CHECKSUM_OFFSET);
     memcpy(buf + SF_CHECKSUM_OFFSET, &cs, 4);
 }
 
@@ -396,7 +396,7 @@ static int unpack_page0(const uint8_t *buf, SchemaFile *sf)
 
     uint32_t stored;
     memcpy(&stored, buf + SF_CHECKSUM_OFFSET, 4);
-    if (stored != fnv1a(buf, SF_CHECKSUM_OFFSET))
+    if (stored != crc32c(buf, SF_CHECKSUM_OFFSET))
         return MYDB_ERR_BAD_CHECKSUM;
 
     deserialize_header(buf, &sf->header);

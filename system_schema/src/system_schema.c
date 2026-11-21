@@ -20,7 +20,7 @@
  *    13..63  : reserved (51 B, zero)
  *    64..7743: 32 x UserSlot (240 B each)
  *    7744..8187: reserved (444 B)
- *    8188..8191: FNV-1a checksum over bytes 0..8187
+ *    8188..8191: CRC-32C checksum over bytes 0..8187
  *
  *  UserSlot on-disk (240 B):
  *    0..3     : user_id (uint32)
@@ -43,7 +43,7 @@
  *    14..63   : reserved (50 B)
  *    64..15423: 256 x PrivilegeSlot (60 B each)
  *    15424..16379: reserved (956 B)
- *    16380..16383: FNV-1a checksum over bytes 0..16379
+ *    16380..16383: CRC-32C checksum over bytes 0..16379
  *
  *  PrivilegeSlot on-disk (60 B):
  *    0..3   : privilege_id (uint32)
@@ -155,7 +155,7 @@ static void users_pack(const UsersFile *uf, uint8_t *buf)
         user_serialize(buf + US_SLOT_OFFSET + i * US_SLOT_SIZE,
                        &uf->slots[i]);
     }
-    uint32_t cs = fnv1a(buf, US_CHECKSUM_OFFSET);
+    uint32_t cs = crc32c(buf, US_CHECKSUM_OFFSET);
     memcpy(buf + US_CHECKSUM_OFFSET, &cs, 4);
 }
 
@@ -168,7 +168,7 @@ static int users_unpack(const uint8_t *buf, UsersFile *uf)
 
     uint32_t stored;
     memcpy(&stored, buf + US_CHECKSUM_OFFSET, 4);
-    if (stored != fnv1a(buf, US_CHECKSUM_OFFSET))
+    if (stored != crc32c(buf, US_CHECKSUM_OFFSET))
         return MYDB_ERR_BAD_CHECKSUM;
 
     memcpy(&uf->next_user_id, buf + 8, 4);
@@ -201,7 +201,7 @@ static uint32_t name_hash(const char *username)
 {
     /* Hash up to MAX_USERNAME bytes, stopping at the first NUL. */
     size_t len = strnlen(username, MAX_USERNAME);
-    return fnv1a(username, len);
+    return crc32c(username, len);
 }
 
 /* Probe the username index for `username`. Returns the bucket position
@@ -302,7 +302,7 @@ static void priv_pack(const PrivilegesFile *pf, uint8_t *buf)
         priv_serialize(buf + PR_SLOT_OFFSET + i * PR_SLOT_SIZE,
                        &pf->slots[i]);
     }
-    uint32_t cs = fnv1a(buf, PR_CHECKSUM_OFFSET);
+    uint32_t cs = crc32c(buf, PR_CHECKSUM_OFFSET);
     memcpy(buf + PR_CHECKSUM_OFFSET, &cs, 4);
 }
 
@@ -313,7 +313,7 @@ static int priv_unpack(const uint8_t *buf, PrivilegesFile *pf)
 
     uint32_t stored;
     memcpy(&stored, buf + PR_CHECKSUM_OFFSET, 4);
-    if (stored != fnv1a(buf, PR_CHECKSUM_OFFSET))
+    if (stored != crc32c(buf, PR_CHECKSUM_OFFSET))
         return MYDB_ERR_BAD_CHECKSUM;
 
     memcpy(&pf->next_privilege_id, buf + 8,  4);
@@ -343,7 +343,7 @@ static int privs_save(PrivilegesFile *pf)
 
 /* Hash the composite key (grantee_id, partition_id, schema_name) by
  * packing the integers and the (NUL-truncated) schema name into a
- * scratch buffer and FNV-1a'ing the whole thing. */
+ * scratch buffer and running crc32c over the whole thing. */
 static uint32_t priv_key_hash(uint32_t grantee_id, uint32_t partition_id,
                               const char *schema_name)
 {
@@ -352,7 +352,7 @@ static uint32_t priv_key_hash(uint32_t grantee_id, uint32_t partition_id,
     memcpy(buf + 4, &partition_id, 4);
     size_t len = strnlen(schema_name, 32);
     memcpy(buf + 8, schema_name, len);
-    return fnv1a(buf, 8 + len);
+    return crc32c(buf, 8 + len);
 }
 
 static int priv_key_match(const PrivilegeSlot *s,

@@ -1233,7 +1233,7 @@ static int64_t val_to_i64(const Value *v)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Hash map insert — FNV-1a-ish mixing on 64-bit key                 */
+/*  Hash map insert — xor-fold of the 64-bit key's two halves         */
 /* ------------------------------------------------------------------ */
 static void hm_insert(ColAnalysis *ca, int64_t key)
 {

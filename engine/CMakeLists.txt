@@ -21,7 +21,7 @@ target_include_directories(engine PUBLIC
 # include paths transitively.
 target_link_libraries(engine PUBLIC
         storage_engine system_schema partition_manager
-        query_parser execution_engine crypto
+        query_parser execution_engine common_utils
 )
 
 target_compile_options(engine PRIVATE -Wall -Wextra -Wpedantic)
