@@ -17,6 +17,22 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # PartitionBuffer's per-outer-slot latch (PARTITION_BUFFER_DESIGN.md §6/§7).
 find_package(Threads REQUIRED)
 
+# Opt-in ThreadSanitizer build: -DMYDB_SANITIZE_THREAD=ON.
+#
+# This was the real verification for large_wal's segment locking (now
+# moved out to ../large_wal_stash) and still is for the WAL's own
+# threads: the Flusher, the worker and the ring buffer's locks. A green
+# run of a threaded test proves very little on its own — a data race
+# usually produces correct output until the day it doesn't — so the
+# locking phase is only actually verified by running the WAL tests under
+# TSan. Off by default because it slows execution ~10x and cannot be
+# combined with ASan/valgrind.
+option(MYDB_SANITIZE_THREAD "Build with ThreadSanitizer (-fsanitize=thread)" OFF)
+if(MYDB_SANITIZE_THREAD)
+    add_compile_options(-fsanitize=thread -g -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=thread)
+endif()
+
 # common_utils — system-wide headers and helpers every module uses:
 # common.h (error codes, Value, Row, FILETYPE_*), file_header, checksum,
 # and crypto (SHA-256 + salt helpers, shared by the engine and the network
@@ -27,6 +43,15 @@ add_subdirectory(common_utils)
 # Storage engine — stateless I/O layer (v3): BufferPool, BTree, Page,
 # DiskManager, RelationDef only.  No session state.
 add_subdirectory(storage_engine)
+# WAL — wal record/page/segment format, ring buffer, segment pool and
+# Flusher: one log. (A second, LARGE_WAL overflow log for records above
+# 4 KB used to sit beside it; it was moved out to ../large_wal_stash once
+# records were allowed to span pages and segments.) Depends only on
+# common_utils (not storage_engine) — WAL manages its own files and
+# doesn't need BufferPool/BTree/DiskManager/RelationDef. Not yet wired
+# into partition_manager's TransactionManager (see
+# MYDB_WAL_IMPLEMENTATION.md §11, deferred).
+add_subdirectory(wal)
 # System schema (users + privileges) — engine-level metadata, lives outside
 # any partition. Depends on common_utils (via storage_engine) for common.h /
 # file_header / checksum.

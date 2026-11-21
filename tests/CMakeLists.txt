@@ -1,18 +1,78 @@
-# common_utils — shared helpers every module uses (checksum, file_header,
-# crypto). test_checksum covers CRC-32C.
-add_executable(test_checksum common_utils/test_checksum.c)
-target_link_libraries(test_checksum PRIVATE common_utils)
-add_test(NAME test_checksum COMMAND test_checksum)
+# common_utils modules (common.h, file_header, checksum) — extracted out
+# of storage_engine in WAL Phase 1 since they're system-wide, not
+# storage-specific.
+set(COMMON_UTILS_TEST_MODULES file_header checksum)
+
+foreach(mod ${COMMON_UTILS_TEST_MODULES})
+    add_executable(test_${mod} common_utils/test_${mod}.c)
+    target_link_libraries(test_${mod} PRIVATE common_utils)
+    add_test(NAME test_${mod} COMMAND test_${mod})
+endforeach()
 
 # Pure storage_engine modules (stateless I/O layer).
 set(STORAGE_ONLY_TEST_MODULES
-    disk_manager page buffer_pool btree file_header relation_def)
+    disk_manager page buffer_pool btree relation_def)
 
 foreach(mod ${STORAGE_ONLY_TEST_MODULES})
     add_executable(test_${mod} storage_engine/test_${mod}.c)
     target_link_libraries(test_${mod} PRIVATE storage_engine)
     add_test(NAME test_${mod} COMMAND test_${mod})
 endforeach()
+
+# WAL — the on-disk struct layer (record/page/segment header
+# format + checksum). Skeleton only this phase: no file I/O, no ring
+# buffer, no threads (see MYDB_WAL_IMPLEMENTATION.md §8).
+add_executable(test_wal_types wal/test_wal_types.c)
+target_link_libraries(test_wal_types PRIVATE wal)
+add_test(NAME test_wal_types COMMAND test_wal_types)
+
+# The large_wal tests (Phases 1-5, the registry, the manager and the
+# concurrency test) and the old test_wal_manager moved out with their code to
+# ../large_wal_stash (tests_CMakeLists_fragment.txt holds their blocks).
+
+# WAL Phase 2 — the pool of 10 physical wal_<N>.mydb segment files:
+# pre-allocation, round-robin claiming, raw page I/O, crash-reload
+# tail-scan (MYDB_WAL_IMPLEMENTATION.md §8.4). Real file I/O under /tmp.
+add_executable(test_wal_segment_pool wal/test_wal_segment_pool.c)
+target_link_libraries(test_wal_segment_pool PRIVATE wal)
+add_test(NAME test_wal_segment_pool COMMAND test_wal_segment_pool)
+
+# WAL Phase 3 — the 16MB ring buffer + txn_append_record LSN assignment
+# (MYDB_WAL_IMPLEMENTATION.md §8.6). No ATT/DPT, no Flusher thread yet.
+add_executable(test_wal_ring_buffer wal/test_wal_ring_buffer.c)
+target_link_libraries(test_wal_ring_buffer PRIVATE wal)
+add_test(NAME test_wal_ring_buffer COMMAND test_wal_ring_buffer)
+
+# WAL Phase 4 — the real Flusher thread (MYDB_WAL_DESIGN.md §7). The
+# first genuinely concurrent test in this codebase.
+add_executable(test_wal_flusher wal/test_wal_flusher.c)
+target_link_libraries(test_wal_flusher PRIVATE wal)
+add_test(NAME test_wal_flusher COMMAND test_wal_flusher)
+
+# wal_mailbox — the shared background-thread + request/response queue
+# that wal_worker and LargeWalWriter's submit() (large_wal, now moved out)
+# were both hand-written copies of. Tests the four rules its header now owns: the depth slot
+# comes back on collect (not on handler completion), a queued request is
+# still served during shutdown, waiting on an unposted node is a no-op,
+# and two callers in flight each collect their own result.
+add_executable(test_wal_mailbox wal/test_wal_mailbox.c)
+target_link_libraries(test_wal_mailbox PRIVATE wal)
+add_test(NAME test_wal_mailbox COMMAND test_wal_mailbox)
+
+# wal_worker — the shared persistent background thread that overlaps a
+# segment rollover's two distinct-file fsyncs (old segment's mark_done,
+# new segment's trailing write) instead of paying for them sequentially.
+add_executable(test_wal_worker wal/test_wal_worker.c)
+target_link_libraries(test_wal_worker PRIVATE wal)
+add_test(NAME test_wal_worker COMMAND test_wal_worker)
+
+# wal_manager (lifecycle/ownership; was normal_wal_manager, which mirrored
+# LargeWalManager, merged with the old top-level wal_manager): owns
+# WalWorker + WalRingBuffer + WalSegmentPool + WalFlusher, one init() call
+# brings all four up together.
+add_executable(test_wal_manager wal/test_wal_manager.c)
+target_link_libraries(test_wal_manager PRIVATE wal)
+add_test(NAME test_wal_manager COMMAND test_wal_manager)
 
 # Session-state modules that moved to partition_manager in v3.
 # Their test files still live under tests/storage_engine/ (moved with git mv
