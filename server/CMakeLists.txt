@@ -24,6 +24,6 @@ target_include_directories(mydb_server PUBLIC
 )
 # The server calls engine_* (auth, dispatch, logout) and crypto_* (nonce
 # generation), and frames packets via mydb_proto.
-target_link_libraries(mydb_server PUBLIC engine crypto mydb_proto)
+target_link_libraries(mydb_server PUBLIC engine common_utils mydb_proto)
 
 target_compile_options(mydb_server PRIVATE -Wall -Wextra -Wpedantic)

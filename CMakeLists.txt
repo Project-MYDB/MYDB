@@ -33,9 +33,12 @@ if(MYDB_SANITIZE_THREAD)
     add_link_options(-fsanitize=thread)
 endif()
 
-# Common utilities — common.h, file_header.h/.c, checksum.h/.c. Genuinely
-# system-wide (every module depends on them), so this is the first
-# subdirectory built, ahead of storage_engine which used to own them.
+# common_utils — system-wide headers and helpers every module uses:
+# common.h (error codes, Value, Row, FILETYPE_*), file_header, checksum,
+# and crypto (SHA-256 + salt helpers, shared by the engine and the network
+# client; lifted out of engine/ when the client became a second consumer,
+# later folded into common_utils).
+# Built first; storage_engine links it PUBLIC.
 add_subdirectory(common_utils)
 # Storage engine — stateless I/O layer (v3): BufferPool, BTree, Page,
 # DiskManager, RelationDef only.  No session state.
@@ -49,12 +52,9 @@ add_subdirectory(storage_engine)
 # into partition_manager's TransactionManager (see
 # MYDB_WAL_IMPLEMENTATION.md §11, deferred).
 add_subdirectory(wal)
-# crypto — SHA-256 + salt helpers, shared by engine (login/bootstrap) and the
-# network client (challenge-response). Lifted out of engine/ when the client
-# became a second consumer. Built before engine + client.
-add_subdirectory(crypto)
 # System schema (users + privileges) — engine-level metadata, lives outside
-# any partition. Depends on storage_engine for common.h / file_header / checksum.
+# any partition. Depends on common_utils (via storage_engine) for common.h /
+# file_header / checksum.
 add_subdirectory(system_schema)
 # Partition manager — owns session state (Catalog, SchemaFile, TxnManager,
 # StatsFile, PartitionBuffer, PartitionCtx).  Wraps storage_engine and
@@ -77,7 +77,8 @@ add_subdirectory(engine)
 # (mydb_server), linked into the mydb-server binary. Built after engine.
 add_subdirectory(server)
 # Client module — socket + REPL library (mydb_client), no engine inside.
-# Built after server (it reuses server/protocol.c) and crypto.
+# Built after server (it reuses server/protocol.c); crypto comes from
+# common_utils.
 add_subdirectory(client)
 # `mydb-server` + `mydb-client` executables (thin mains over the libs above).
 add_subdirectory(bin)

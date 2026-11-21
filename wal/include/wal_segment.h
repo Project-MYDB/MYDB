@@ -51,7 +51,7 @@ typedef struct {
     uint32_t data_pages;       /* valid 4KB pages written                */
     uint8_t  state;            /* WalSegState                            */
     uint8_t  reserved[3];
-    uint32_t checksum;         /* CRC32 over the preceding 44 bytes      */
+    uint32_t checksum;         /* CRC-32C over the preceding 44 bytes    */
 } WalSegmentHeader;
 
 #define WAL_SEGMENT_HEADER_ON_DISK_SIZE  64   /* on-disk footprint: 48 documented bytes + 16 padding */
@@ -62,7 +62,7 @@ typedef struct {
  * wal_segment_header_serialize fills a WAL_SEGMENT_HEADER_ON_DISK_SIZE
  * (64-byte) buffer from *hdr — the trailing 16 padding bytes are
  * zeroed, matching the on-disk footprint the segment-file-I/O phase will
- * actually write — and stamps its checksum field (CRC32 over the bytes
+ * actually write — and stamps its checksum field (CRC-32C over the bytes
  * preceding it). Caller sets every field of *hdr except checksum first.
  *
  * wal_segment_header_deserialize validates the FileHeaderId (magic/

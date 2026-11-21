@@ -30,7 +30,7 @@ void wal_page_header_serialize(const WalPageHeader *hdr, uint8_t *buf)
     buf[18] = hdr->flags;
     buf[19] = hdr->reserved[0];
 
-    uint32_t cs = crc32(buf, WAL_PAGE_HEADER_CHECKSUM_OFFSET);
+    uint32_t cs = crc32c(buf, WAL_PAGE_HEADER_CHECKSUM_OFFSET);
     memcpy(buf + WAL_PAGE_HEADER_CHECKSUM_OFFSET, &cs, 4);
 }
 
@@ -41,7 +41,7 @@ int wal_page_header_deserialize(const uint8_t *buf, WalPageHeader *out)
 
     uint32_t stored;
     memcpy(&stored, buf + WAL_PAGE_HEADER_CHECKSUM_OFFSET, 4);
-    if (stored != crc32(buf, WAL_PAGE_HEADER_CHECKSUM_OFFSET))
+    if (stored != crc32c(buf, WAL_PAGE_HEADER_CHECKSUM_OFFSET))
         return MYDB_ERR_BAD_CHECKSUM;
 
     file_header_read_id(buf, &out->id);

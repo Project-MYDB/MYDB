@@ -5,57 +5,55 @@
 #include <stdint.h>
 
 /* ------------------------------------------------------------------ */
-/*  FNV-1a 32-bit hash. No longer the metadata-file trailer checksum  */
-/*  (see crc32() below) — kept for the one remaining consumer that    */
-/*  genuinely wants a hash, not a corruption-detection checksum:      */
-/*  system_schema.c's name_hash() (username -> hash-table bucket).    */
+/*  CRC-32C (Castagnoli): reflected, polynomial 0x82F63B78, initial   */
+/*  and final XOR 0xFFFFFFFF. The one checksum and hash every module  */
+/*  uses: data pages (page.c), the metadata-file trailers             */
+/*  (__database.mydb, __catalog.mydb, __schema.mydb, stats files,     */
+/*  users.mydb, privileges.mydb), system_schema's hash-table buckets  */
+/*  and, later, the WAL. Check value:                                 */
+/*  crc32c("123456789") == 0xE3069283.                                */
 /*                                                                    */
-/*    seed  = 0x811c9dc5                                              */
-/*    prime = 0x01000193                                              */
+/*  On x86-64 with SSE4.2 (every x86 CPU since 2008) it uses the      */
+/*  crc32 instruction, which computes exactly this polynomial, 8      */
+/*  bytes at a time, as PostgreSQL and InnoDB do. Otherwise (an older */
+/*  CPU, or a non-x86 build) it falls back to a table-driven loop,    */
+/*  one byte per step, whose 256-entry table is a compile-time        */
+/*  constant. The choice is made per call from the CPU's feature      */
+/*  bits, so there is no shared state to set up and concurrent        */
+/*  callers need nothing.                                             */
 /*                                                                    */
-/*  Originally lived in database_file.c and partition.c as static     */
-/*  helpers; lifted here once schema_file.c became the third          */
-/*  consumer.                                                         */
+/*  FNV-1a, which this header used to provide (first as the metadata  */
+/*  trailer checksum, then only as the hash-table hash), is gone:     */
+/*  crc32c is faster on this hardware for both jobs.                  */
 /* ------------------------------------------------------------------ */
-uint32_t fnv1a(const void *data, size_t len);
+uint32_t crc32c(const void *data, size_t len);
 
 /* ------------------------------------------------------------------ */
-/*  CRC32 (reflected, polynomial 0xEDB88320 / IEEE 802.3 — the same   */
-/*  algorithm InnoDB and zlib use). This is the trailer checksum for  */
-/*  every fixed-size MyDB metadata file (__database.mydb,             */
-/*  __catalog.mydb, __schema.mydb, __stats.mydb, users.mydb,          */
-/*  privileges.mydb) and for WAL page/record/segment headers          */
-/*  (MYDB_WAL_DESIGN.md / MYDB_WAL_IMPLEMENTATION.md both specify     */
-/*  CRC32 explicitly, distinct from the FNV-1a used elsewhere).       */
-/*  Table-driven, 256-entry lookup table computed lazily on first     */
-/*  call.                                                             */
+/*  Incremental CRC-32C: the same checksum as crc32c(), split so it   */
+/*  can cover several buffers that are not next to each other,        */
+/*  without copying them into one scratch first:                      */
+/*                                                                    */
+/*    uint32_t c = CRC32C_INIT;                                       */
+/*    c = crc32c_update(c, part_a, a_len);                            */
+/*    c = crc32c_update(c, part_b, b_len);                            */
+/*    uint32_t result = crc32c_final(c);   // == crc32c(a ++ b)       */
 /* ------------------------------------------------------------------ */
-uint32_t crc32(const void *data, size_t len);
-
-/* ------------------------------------------------------------------ */
-/*  Incremental CRC32 — same algorithm/parameters as crc32() above,    */
-/*  just split so a checksum can span several non-contiguous buffers   */
-/*  without copying them into one scratch first:                       */
-/*                                                                     */
-/*    uint32_t c = CRC32_INIT;                                         */
-/*    c = crc32_update(c, part_a, a_len);                              */
-/*    c = crc32_update(c, part_b, b_len);                              */
-/*    uint32_t result = crc32_final(c);   // == crc32(a ++ b)          */
-/*                                                                     */
-/*  This is what WalRecordHeader's checksum needs: it covers the       */
-/*  header's leading bytes plus the record body, two spans that are    */
-/*  not adjacent on disk (the checksum field itself sits between       */
-/*  them). Copying both into a stack scratch — the old approach —      */
-/*  bounded record bodies to the scratch's size, which LARGE_WAL       */
-/*  records exceeded by definition, as records spanning pages will.    */
-/* ------------------------------------------------------------------ */
-#define CRC32_INIT 0xFFFFFFFFu
+#define CRC32C_INIT 0xFFFFFFFFu
 
 /* Folds len bytes into the running state. Not a finished checksum on
- * its own — pass the result to crc32_final(). */
-uint32_t crc32_update(uint32_t crc, const void *data, size_t len);
+ * its own: pass the result to crc32c_final(). */
+uint32_t crc32c_update(uint32_t crc, const void *data, size_t len);
 
 /* Applies the final XOR, turning running state into the checksum. */
-static inline uint32_t crc32_final(uint32_t crc) { return ~crc; }
+static inline uint32_t crc32c_final(uint32_t crc) { return ~crc; }
+
+/* The software (table) path on its own, the same running-state contract
+ * as crc32c_update. Callers use crc32c_update, which picks the hardware
+ * path when it can; this is exposed so test_checksum can test the
+ * fallback too on a machine that would never take it. */
+uint32_t crc32c_update_sw(uint32_t crc, const void *data, size_t len);
+
+/* 1 if crc32c_update uses the hardware instruction on this CPU, else 0. */
+int crc32c_uses_hardware(void);
 
 #endif /* CHECKSUM_H */

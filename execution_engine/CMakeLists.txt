@@ -40,14 +40,14 @@ target_include_directories(execution_engine PUBLIC
 
 # engine.h and system_schema.h are needed by implementation files but
 # must not be exposed as part of this library's public interface.
-# crypto/include is added because engine.h includes crypto.h (SALT_LEN /
-# SHA256_DIGEST_LEN / MYDB_NONCE_LEN for the network-login signatures);
-# header path only — the crypto symbols are resolved at final-binary link.
+# engine.h includes crypto.h (SALT_LEN / SHA256_DIGEST_LEN /
+# MYDB_NONCE_LEN for the network-login signatures). crypto.h now lives in
+# common_utils, whose include path arrives through partition_manager ->
+# storage_engine's PUBLIC link, so it needs no path of its own here.
 target_include_directories(execution_engine PRIVATE
     ${CMAKE_SOURCE_DIR}/engine/include
     ${CMAKE_SOURCE_DIR}/system_schema/include
     ${CMAKE_SOURCE_DIR}/partition_manager/include
-    ${CMAKE_SOURCE_DIR}/crypto/include
 )
 
 target_link_libraries(execution_engine

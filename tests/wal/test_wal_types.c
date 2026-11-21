@@ -77,7 +77,7 @@ static void test_page_header_round_trip(void)
     memcpy(&cs, buf + 20, 4);
     CHECK(sl == hdr.start_lsn && cl == 1234 && buf[18] == hdr.flags && buf[19] == 0x5C,
           "fields sit at their documented offsets");
-    CHECK(cs == crc32(buf, 20), "the CRC at 20-23 covers bytes 0-19");
+    CHECK(cs == crc32c(buf, 20), "the CRC at 20-23 covers bytes 0-19");
 }
 
 static void test_page_header_detects_tamper(void)
@@ -169,7 +169,7 @@ static void test_segment_header_detects_tamper(void)
  * be impossible: serialize/deserialize copied header+body into a stack
  * scratch sized `40 + WAL_MAX_ROW_BODY` (4020; the constant is gone
  * now), so any LARGE_WAL-sized body
- * (or a record spanning pages) overran it. Both now fold the two spans in with crc32_update instead,
+ * (or a record spanning pages) overran it. Both now fold the two spans in with crc32c_update instead,
  * with no scratch and no size ceiling. */
 static void test_record_header_large_body(void)
 {

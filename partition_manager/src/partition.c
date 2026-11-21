@@ -23,7 +23,7 @@
 /*    57..127 : reserved (71 B) — headroom for future fields          */
 /*    128..2687: 64 × SchemaEntry, 40 B each                          */
 /*    2688..  : reserved block (1400 B)                               */
-/*    4088..  : FNV-1a checksum over bytes 0..4087 (4 B)              */
+/*    4088..  : CRC-32C checksum over bytes 0..4087 (4 B)             */
 /*    4092..  : reserved (4 B)                                        */
 /* ------------------------------------------------------------------ */
 
@@ -110,7 +110,7 @@ static void pack(const Catalog *cat, uint8_t *buf)
         serialize_schema(buf + CAT_SCHEMA_OFFSET + i * CAT_SCHEMA_SIZE,
                          &cat->schemas[i]);
     }
-    uint32_t cs = crc32(buf, CAT_CHECKSUM_OFFSET);
+    uint32_t cs = crc32c(buf, CAT_CHECKSUM_OFFSET);
     memcpy(buf + CAT_CHECKSUM_OFFSET, &cs, 4);
 }
 
@@ -121,7 +121,7 @@ static int unpack(const uint8_t *buf, Catalog *cat)
 
     uint32_t stored;
     memcpy(&stored, buf + CAT_CHECKSUM_OFFSET, 4);
-    if (stored != crc32(buf, CAT_CHECKSUM_OFFSET))
+    if (stored != crc32c(buf, CAT_CHECKSUM_OFFSET))
         return MYDB_ERR_BAD_CHECKSUM;
 
     deserialize_header(buf, &cat->header);

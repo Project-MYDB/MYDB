@@ -36,7 +36,7 @@
  *   continuation_len  16-17  leading bytes that continue an earlier record
  *   flags             18     WAL_PAGE_INCOMING_CONTINUATION
  *   reserved          19
- *   checksum          20-23  CRC32 over bytes 0-19
+ *   checksum          20-23  CRC-32C over bytes 0-19
  *
  * start_lsn is fixed by where the page sits, so its only job is the
  * stale check: a page left over from an earlier lap of a reused segment
@@ -57,14 +57,14 @@ typedef struct {
     uint16_t     continuation_len;      /* leading bytes continuing an earlier record */
     uint8_t      flags;         /* WAL_PAGE_INCOMING_CONTINUATION          */
     uint8_t      reserved[1];
-    uint32_t     checksum;      /* CRC32 over the preceding 20 bytes      */
+    uint32_t     checksum;      /* CRC-32C over the preceding 20 bytes    */
 } WalPageHeader;
 
 /* ------------------------------------------------------------------
  * Serialize/deserialize + checksum.
  *
  * wal_page_header_serialize fills buf[0..WAL_PAGE_HEADER_SIZE) from *hdr
- * and stamps buf's checksum field (CRC32 over the bytes preceding it).
+ * and stamps buf's checksum field (CRC-32C over the bytes preceding it).
  * Caller sets every field of *hdr except checksum first.
  *
  * wal_page_header_deserialize validates the FileHeaderId (magic/version/

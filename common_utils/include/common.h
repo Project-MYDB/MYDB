@@ -79,10 +79,9 @@
 /* ------------------------------------------------------------------ */
 /*  On-disk format version. Bumped when any file layout changes in    */
 /*  a way that older binaries can't read.                             */
-/*  v3: bumped 2 -> 3 when every metadata-file checksum moved from    */
-/*  FNV-1a to CRC32 (WAL Phase 1) — old files fail MYDB_ERR_BAD_      */
-/*  CHECKSUM under the new algorithm, not a version mismatch, but the */
-/*  on-disk format genuinely changed.                                 */
+/*  3: every checksum (data pages and metadata-file trailers) moved   */
+/*  from FNV-1a to CRC-32C, so files written by version 2 fail their  */
+/*  checksum and are refused by the version check first.              */
 /* ------------------------------------------------------------------ */
 #define MYDB_FORMAT_VERSION  3
 

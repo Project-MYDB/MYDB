@@ -45,7 +45,7 @@ typedef struct {
     uint8_t  rec_type;         /* WalRecType, stored as a byte            */
     uint8_t  flags;            /* WAL_RECORD_FLAG_*                       */
     uint8_t  reserved[2];      /* was reserved[3]; one byte moved to flags */
-    uint32_t checksum;         /* CRC32 over header + body                */
+    uint32_t checksum;         /* CRC-32C over header + body              */
 } WalRecordHeader;
 
 /* Set when this record's bytes do not all fit on the page its header
@@ -72,8 +72,8 @@ typedef struct {
  * two regions that are not contiguous in the final on-disk layout
  * (checksum itself sits between them, at header offset 40). Both
  * functions used to build a small scratch buffer (header-minus-checksum
- * ++ body) to compute one CRC32 over that combined span; they now fold
- * the two spans in with crc32_update (wal_types.c), so there is no
+ * ++ body) to compute one CRC over that combined span; they now fold
+ * the two spans in with crc32c_update (wal_types.c), so there is no
  * scratch and no size ceiling. serialize writes the real fixed layout
  * (header incl. checksum at its own offset, followed by body) into buf,
  * which must have room for WAL_RECORD_HEADER_SIZE + body_len bytes.

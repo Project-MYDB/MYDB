@@ -10,7 +10,7 @@
  *   Page 0 (16 KB):
  *     0..7   : FileHeaderId (MYDB_MAGIC / version / FILETYPE_STATS)
  *     8..39  : schema_name[32]
- *     40..43 : FNV-1a checksum over bytes 0..39
+ *     40..43 : CRC-32C checksum over bytes 0..39
  *     44..   : zeroed
  *
  *   Pages 1..64 (relation stats pages, allocated lazily on ANALYZE):
@@ -18,7 +18,7 @@
  *     8..11  : slot_idx    (uint32, LE)
  *     12..15 : blob_used   (uint32, LE)
  *     16..2063: ColumnStats[MAX_COLUMNS] (32 × 64 = 2048 B, raw memcpy)
- *     2064..2067: FNV-1a checksum over bytes 0..2063
+ *     2064..2067: CRC-32C checksum over bytes 0..2063
  *     2068..2071: padding (keeps blob pool 8-byte aligned at offset 2072)
  *     2072..16383: blob pool (MCVEntry / HistBucket raw bytes)
  */
@@ -78,7 +78,7 @@ int stats_create(const char *path, const char *schema_name, StatsFile *out)
     memset(buf, 0, PAGE_SIZE);
     file_header_write_id(buf, FILETYPE_STATS);
     strncpy((char *)(buf + P0_SCHEMA_OFF), schema_name, 31);
-    uint32_t cksum = crc32(buf, (size_t)P0_CKSUM_OFF);
+    uint32_t cksum = crc32c(buf, (size_t)P0_CKSUM_OFF);
     wr_u32(buf, P0_CKSUM_OFF, cksum);
 
     if (pwrite(fd, buf, PAGE_SIZE, 0) != PAGE_SIZE) {
@@ -116,7 +116,7 @@ int stats_open(const char *path, StatsFile *out)
     }
 
     uint32_t stored = rd_u32(buf, P0_CKSUM_OFF);
-    uint32_t calc   = crc32(buf, (size_t)P0_CKSUM_OFF);
+    uint32_t calc   = crc32c(buf, (size_t)P0_CKSUM_OFF);
     if (stored != calc) {
         close(fd);
         return MYDB_ERR_BAD_CHECKSUM;
@@ -146,7 +146,7 @@ int stats_close(StatsFile *sf)
 /*  The on-disk page format is validated in two steps:                 */
 /*    1. file_header_check_id: if the magic is zero, the page was      */
 /*       never written → MYDB_ERR_NOT_FOUND (graceful, not an error).  */
-/*    2. CRC32 checksum over the fixed header + ColumnStats array      */
+/*    2. CRC-32C checksum over the fixed header + ColumnStats array    */
 /*       (bytes 0..2063): guards against truncated writes.             */
 /* ------------------------------------------------------------------ */
 int stats_load_relation(StatsFile *sf, int slot_idx)
@@ -171,7 +171,7 @@ int stats_load_relation(StatsFile *sf, int slot_idx)
 
     /* Verify the checksum before trusting any data. */
     uint32_t stored = rd_u32(buf, STATS_REL_CKSUM_OFF);
-    uint32_t calc   = crc32(buf, (size_t)STATS_REL_CKSUM_OFF);
+    uint32_t calc   = crc32c(buf, (size_t)STATS_REL_CKSUM_OFF);
     if (stored != calc)
         return MYDB_ERR_BAD_CHECKSUM;
 
@@ -214,7 +214,7 @@ int stats_save_relation(StatsFile *sf, int slot_idx)
     memcpy(buf + STATS_REL_COLS_OFF, rs->cols, sizeof(rs->cols));
 
     /* Checksum covers the fixed header + ColumnStats (bytes 0..2063). */
-    uint32_t cksum = crc32(buf, (size_t)STATS_REL_CKSUM_OFF);
+    uint32_t cksum = crc32c(buf, (size_t)STATS_REL_CKSUM_OFF);
     wr_u32(buf, STATS_REL_CKSUM_OFF, cksum);
 
     /* Blob pool data follows after the padding gap. */

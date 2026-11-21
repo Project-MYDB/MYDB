@@ -35,7 +35,7 @@ void wal_segment_header_serialize(const WalSegmentHeader *hdr, uint8_t *buf)
     buf[40] = hdr->state;
     /* buf[41..44) reserved, already zeroed by the memset above */
 
-    uint32_t cs = crc32(buf, WAL_SEGMENT_HEADER_CHECKSUM_OFFSET);
+    uint32_t cs = crc32c(buf, WAL_SEGMENT_HEADER_CHECKSUM_OFFSET);
     memcpy(buf + WAL_SEGMENT_HEADER_CHECKSUM_OFFSET, &cs, 4);
 }
 
@@ -46,7 +46,7 @@ int wal_segment_header_deserialize(const uint8_t *buf, WalSegmentHeader *out)
 
     uint32_t stored;
     memcpy(&stored, buf + WAL_SEGMENT_HEADER_CHECKSUM_OFFSET, 4);
-    if (stored != crc32(buf, WAL_SEGMENT_HEADER_CHECKSUM_OFFSET))
+    if (stored != crc32c(buf, WAL_SEGMENT_HEADER_CHECKSUM_OFFSET))
         return MYDB_ERR_BAD_CHECKSUM;
 
     file_header_read_id(buf, &out->id);

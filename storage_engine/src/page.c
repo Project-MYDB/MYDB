@@ -1,4 +1,5 @@
 #include "page.h"
+#include "checksum.h"
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -119,24 +120,17 @@ void page_write_header(uint8_t *page, const PageHeader *hdr)
 }
 
 /* ------------------------------------------------------------------ */
-/*  FNV-1a checksum over bytes [4 .. PAGE_SIZE-9]                     */
-/*  (skips the checksum field itself and the trailer)                 */
+/*  CRC-32C checksum over bytes [4 .. PAGE_SIZE-9]                    */
+/*  (skips the checksum field itself and the trailer). It was a       */
+/*  private FNV-1a copy here; it now uses the shared crc32c() from    */
+/*  common_utils/checksum.h, like every other checksum in MyDB.       */
 /* ------------------------------------------------------------------ */
-static uint32_t fnv1a(const uint8_t *data, size_t len)
-{
-    uint32_t hash = 0x811C9DC5u;
-    for (size_t i = 0; i < len; i++) {
-        hash ^= data[i];
-        hash *= 0x01000193u;
-    }
-    return hash;
-}
 
 void page_set_checksum(uint8_t *page)
 {
     /* Checksum covers everything except the first 4 bytes (checksum field)
        and the last 8 bytes (trailer). */
-    uint32_t cs = fnv1a(page + 4, PAGE_SIZE - 4 - PAGE_TRAILER_SIZE);
+    uint32_t cs = crc32c(page + 4, PAGE_SIZE - 4 - PAGE_TRAILER_SIZE);
     put32(page, cs);
     /* Mirror to trailer */
     put32(page + PAGE_SIZE - PAGE_TRAILER_SIZE, cs);
@@ -145,7 +139,7 @@ void page_set_checksum(uint8_t *page)
 int page_verify_checksum(const uint8_t *page)
 {
     uint32_t stored  = get32(page);
-    uint32_t computed = fnv1a(page + 4, PAGE_SIZE - 4 - PAGE_TRAILER_SIZE);
+    uint32_t computed = crc32c(page + 4, PAGE_SIZE - 4 - PAGE_TRAILER_SIZE);
     //printf("Stored: %u\n", stored);
     //printf("Computed %u", computed);
     return (stored == computed) ? MYDB_OK : MYDB_ERR;

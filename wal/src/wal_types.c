@@ -13,7 +13,7 @@
 
 /* The checksum covers the header's leading 40 bytes plus the body — two
  * spans that aren't adjacent in the final layout (the checksum field
- * itself sits between them, at offset 40). crc32_update lets us fold
+ * itself sits between them, at offset 40). crc32c_update lets us fold
  * both in without copying them into one scratch buffer first. The old
  * code did use a scratch, sized `40 + WAL_MAX_ROW_BODY` (4060, a constant
  * since removed) on the stack,
@@ -23,10 +23,10 @@
  * for the first large record to pass through here. */
 static uint32_t record_checksum(const uint8_t *hdr_buf, const void *body, size_t body_len)
 {
-    uint32_t c = CRC32_INIT;
-    c = crc32_update(c, hdr_buf, WAL_RECORD_HEADER_CHECKSUM_OFFSET);
-    c = crc32_update(c, body, body_len);
-    return crc32_final(c);
+    uint32_t c = CRC32C_INIT;
+    c = crc32c_update(c, hdr_buf, WAL_RECORD_HEADER_CHECKSUM_OFFSET);
+    c = crc32c_update(c, body, body_len);
+    return crc32c_final(c);
 }
 
 void wal_record_header_pack(WalRecordHeader *hdr, const void *body,

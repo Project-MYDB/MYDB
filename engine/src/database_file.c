@@ -20,7 +20,7 @@
 /*    64..127 : reserved (64 B, zero) — headroom for future fields    */
 /*    128..4607: 16 PartitionEntry records, 280 B each                */
 /*    4608..  : reserved block (3580 B, zero)                         */
-/*    8188..  : FNV-1a checksum over bytes 0..8187 (4 B)              */
+/*    8188..  : CRC-32C checksum over bytes 0..8187 (4 B)             */
 /* ------------------------------------------------------------------ */
 
 #define DB_HEADER_SIZE       128
@@ -104,7 +104,7 @@ static void pack(const DatabaseFile *db, uint8_t *buf)
             buf + DB_PARTITION_OFFSET + i * DB_PARTITION_SIZE,
             &db->partitions[i]);
     }
-    uint32_t cs = crc32(buf, DB_CHECKSUM_OFFSET);
+    uint32_t cs = crc32c(buf, DB_CHECKSUM_OFFSET);
     memcpy(buf + DB_CHECKSUM_OFFSET, &cs, 4);
 }
 
@@ -117,7 +117,7 @@ static int unpack(const uint8_t *buf, DatabaseFile *db)
 
     uint32_t stored;
     memcpy(&stored, buf + DB_CHECKSUM_OFFSET, 4);
-    if (stored != crc32(buf, DB_CHECKSUM_OFFSET))
+    if (stored != crc32c(buf, DB_CHECKSUM_OFFSET))
         return MYDB_ERR_BAD_CHECKSUM;
 
     deserialize_header(buf, &db->header);

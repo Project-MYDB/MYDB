@@ -14,106 +14,107 @@ static int tests_passed = 0;
 
 /* ------------------------------------------------------------------ */
 
-static void test_crc32_check_value(void)
+/* The standard CRC-32C check value. CRC-32 IEEE would give 0xCBF43926
+ * here, so this also proves the polynomial is Castagnoli, not IEEE. */
+static void test_check_value(void)
 {
-    printf("\n[test_crc32_check_value]\n");
-    /* Standard CRC-32/ISO-HDLC check value: CRC-32 of the ASCII string
-     * "123456789" is 0xCBF43926 — used across every CRC-32 implementation
-     * (zlib, InnoDB, etc.) as the canonical self-test vector. */
-    const char *check_str = "123456789";
-    uint32_t cs = crc32(check_str, strlen(check_str));
-    CHECK(cs == 0xCBF43926u, "crc32(\"123456789\") == 0xCBF43926");
+    printf("\n[test_check_value]\n");
+    CHECK(crc32c("123456789", 9) == 0xE3069283u, "crc32c(\"123456789\") == 0xE3069283");
+    CHECK(crc32c("123456789", 9) != 0xCBF43926u, "not the CRC-32 IEEE value");
+    CHECK(crc32c("", 0) == 0x00000000u,          "crc32c of no bytes is 0");
 }
 
-static void test_crc32_empty(void)
+/* Splitting the input anywhere gives the same checksum as one call. */
+static void test_incremental(void)
 {
-    printf("\n[test_crc32_empty]\n");
-    uint32_t cs = crc32("", 0);
-    CHECK(cs == 0x00000000u, "crc32 of zero-length input is 0");
-}
+    printf("\n[test_incremental]\n");
+    uint8_t buf[1000];
+    for (size_t i = 0; i < sizeof(buf); i++) buf[i] = (uint8_t)(i * 7 + 3);
 
-static void test_crc32_round_trip(void)
-{
-    printf("\n[test_crc32_round_trip]\n");
-    uint8_t buf[64];
-    for (int i = 0; i < 64; i++) buf[i] = (uint8_t)(i * 7 + 3);
-
-    uint32_t a = crc32(buf, sizeof(buf));
-    uint32_t b = crc32(buf, sizeof(buf));
-    CHECK(a == b, "same input produces the same checksum");
-}
-
-static void test_crc32_detects_tamper(void)
-{
-    printf("\n[test_crc32_detects_tamper]\n");
-    uint8_t buf[64];
-    for (int i = 0; i < 64; i++) buf[i] = (uint8_t)(i * 7 + 3);
-
-    uint32_t before = crc32(buf, sizeof(buf));
-    buf[31] ^= 0x01;   /* flip one bit */
-    uint32_t after = crc32(buf, sizeof(buf));
-    CHECK(before != after, "flipping one bit changes the checksum");
-}
-
-static void test_fnv1a_still_works(void)
-{
-    printf("\n[test_fnv1a_still_works]\n");
-    /* fnv1a() stays in checksum.h for the hash-table use cases
-     * (system_schema.c's name_hash()/priv_key_hash()) even though every
-     * corruption-detection checksum in the codebase moved to crc32(). */
-    uint32_t a = fnv1a("hello", 5);
-    uint32_t b = fnv1a("hello", 5);
-    uint32_t c = fnv1a("world", 5);
-    CHECK(a == b, "fnv1a is deterministic");
-    CHECK(a != c, "fnv1a distinguishes different inputs");
-}
-
-/* The incremental form must agree with the one-shot form over the
- * concatenation — that equivalence is what lets WalRecordHeader checksum
- * its header and body (two spans that aren't adjacent on disk) without
- * copying them into one scratch buffer first. */
-static void test_crc32_incremental_matches_one_shot(void)
-{
-    printf("\n[test_crc32_incremental_matches_one_shot]\n");
-
-    const char *whole = "the quick brown fox jumps over the lazy dog";
-    size_t len = strlen(whole);
-
-    uint32_t one_shot = crc32(whole, len);
-
-    /* Split at several points, including both degenerate ends. */
+    uint32_t whole = crc32c(buf, sizeof(buf));
     int all_match = 1;
-    for (size_t split = 0; split <= len; split++) {
-        uint32_t c = CRC32_INIT;
-        c = crc32_update(c, whole, split);
-        c = crc32_update(c, whole + split, len - split);
-        if (crc32_final(c) != one_shot) all_match = 0;
+    for (size_t cut = 0; cut <= sizeof(buf); cut++) {
+        uint32_t c = CRC32C_INIT;
+        c = crc32c_update(c, buf, cut);
+        c = crc32c_update(c, buf + cut, sizeof(buf) - cut);
+        if (crc32c_final(c) != whole) { all_match = 0; break; }
     }
-    CHECK(all_match, "crc32_update across every possible split equals the one-shot crc32");
-
-    uint32_t three = CRC32_INIT;
-    three = crc32_update(three, "the quick ", 10);
-    three = crc32_update(three, "brown fox ", 10);
-    three = crc32_update(three, whole + 20, len - 20);
-    CHECK(crc32_final(three) == one_shot, "three-way split also matches");
-
-    CHECK(crc32_final(crc32_update(CRC32_INIT, NULL, 0)) == crc32(NULL, 0),
-          "the empty case agrees too");
+    CHECK(all_match, "two-part update equals one-shot crc32c at every cut");
 }
 
-/* ------------------------------------------------------------------ */
+/* Reference CRC-32C worked bit by bit straight from the definition
+ * (reflected, polynomial 0x82F63B78). It lives only here, as an
+ * independent check on both product paths: the hardware one and the
+ * table fallback. */
+static uint32_t ref_crc32c_update(uint32_t crc, const uint8_t *p, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        crc ^= p[i];
+        for (int bit = 0; bit < 8; bit++)
+            crc = (crc >> 1) ^ (0x82F63B78u & -(crc & 1u));
+    }
+    return crc;
+}
+
+/* Both paths match the reference for every length 0..300 (so every
+ * 8/4/1-byte tail mix of the hardware path) at every start offset 0..7
+ * (unaligned loads), over pseudo-random bytes, plus an unaligned 16 KB
+ * data page. crc32c_update takes the hardware path on this CPU when it
+ * can; crc32c_update_sw is the fallback, tested directly since this
+ * machine would otherwise never run it. */
+static void test_matches_reference(void)
+{
+    printf("\n[test_matches_reference]\n");
+    printf("  crc32c path in use: %s\n",
+           crc32c_uses_hardware() ? "hardware (SSE4.2 crc32)" : "software (table)");
+
+    static uint8_t buf[16384 + 8];
+    uint32_t x = 0x12345678u;
+    for (size_t i = 0; i < sizeof(buf); i++) {
+        x = x * 1103515245u + 12345u;
+        buf[i] = (uint8_t)(x >> 16);
+    }
+
+    int all_match = 1;
+    for (size_t off = 0; off < 8 && all_match; off++)
+        for (size_t len = 0; len <= 300; len++) {
+            if (crc32c_update(CRC32C_INIT, buf + off, len) !=
+                ref_crc32c_update(CRC32C_INIT, buf + off, len)) { all_match = 0; break; }
+        }
+    CHECK(all_match, "crc32c_update matches the bit-by-bit reference for len 0..300, offsets 0..7");
+
+    int sw_match = 1;
+    for (size_t off = 0; off < 8 && sw_match; off++)
+        for (size_t len = 0; len <= 300; len++) {
+            if (crc32c_update_sw(CRC32C_INIT, buf + off, len) !=
+                ref_crc32c_update(CRC32C_INIT, buf + off, len)) { sw_match = 0; break; }
+        }
+    CHECK(sw_match, "crc32c_update_sw (fallback) matches the reference for len 0..300, offsets 0..7");
+
+    CHECK(crc32c_update(CRC32C_INIT, buf + 3, 16384) == ref_crc32c_update(CRC32C_INIT, buf + 3, 16384),
+          "crc32c_update matches the reference on an unaligned 16 KB page");
+    CHECK(crc32c_update_sw(CRC32C_INIT, buf + 3, 16384) == ref_crc32c_update(CRC32C_INIT, buf + 3, 16384),
+          "crc32c_update_sw matches the reference on an unaligned 16 KB page");
+}
+
+/* One flipped bit changes the checksum. */
+static void test_detects_bit_flip(void)
+{
+    printf("\n[test_detects_bit_flip]\n");
+    uint8_t buf[64];
+    memset(buf, 0xAB, sizeof(buf));
+    uint32_t before = crc32c(buf, sizeof(buf));
+    buf[37] ^= 0x10;
+    CHECK(crc32c(buf, sizeof(buf)) != before, "a flipped bit changes the checksum");
+}
 
 int main(void)
 {
     printf("=== test_checksum ===\n");
-
-    test_crc32_check_value();
-    test_crc32_empty();
-    test_crc32_round_trip();
-    test_crc32_detects_tamper();
-    test_crc32_incremental_matches_one_shot();
-    test_fnv1a_still_works();
-
+    test_check_value();
+    test_incremental();
+    test_matches_reference();
+    test_detects_bit_flip();
     printf("\nResults: %d/%d passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
 }

@@ -44,7 +44,7 @@ typedef struct {
 int db_create(const char *path, const char *engine_name, DatabaseFile *out);
 
 /* Open an existing __database.mydb. Verifies magic, version, file
- * type and FNV-1a checksum. Updates last_opened and saves. */
+ * type and CRC-32C checksum. Updates last_opened and saves. */
 int db_open(const char *path, DatabaseFile *out);
 
 /* Close the file descriptor. Does not flush — call db_save first if
