@@ -15,6 +15,8 @@ CLAUDE.md
 
 # ── CMake build output ─────────────────────────────────────────────────
 build/
+# -DMYDB_SANITIZE_THREAD=ON build, kept separate from build/
+build-tsan/
 cmake-build-debug/
 cmake-build-release/
 CMakeCache.txt

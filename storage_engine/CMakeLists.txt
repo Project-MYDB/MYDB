@@ -13,7 +13,7 @@ add_library(storage_engine STATIC
 # storage.c needs partition_ctx.h from partition_manager to accept a
 # PartitionCtx* in future APIs; for v3 Phase 2 it only needs its own headers.
 
-# file_header.c/checksum.c moved to common_utils/ — common.h,
+# file_header.c/checksum.c moved to common_utils/ (WAL Phase 1) — common.h,
 # file_header.h and checksum.h are system-wide, not storage-specific.
 # Linking common_utils PUBLIC keeps every existing bare
 # #include "common.h" resolving unchanged for storage_engine's own files
