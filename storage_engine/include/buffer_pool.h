@@ -8,7 +8,7 @@
  * buffer_pool.h — LRU page cache
  *
  * Sits between the B+ Tree and disk. All page reads/writes from the
- * B+ Tree go through here. Pages are cached in 64 frames.
+ * B+ Tree go through here. Pages are cached in frames.
  *
  * Usage pattern:
  *   uint8_t *page = bp_fetch_page(bp, dm, table_id, page_no);
@@ -33,7 +33,7 @@ typedef struct {
     uint8_t      is_valid;        /* 1 = frame holds a real page */
 } BPFrame;
 
-/* The buffer pool — 64 frames, LRU eviction */
+/* The buffer pool — BUFFER_POOL_SIZE frames, LRU eviction */
 typedef struct {
     BPFrame  frames[BUFFER_POOL_SIZE];
     /*

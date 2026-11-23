@@ -37,17 +37,10 @@ add_executable(test_wal_segment_pool wal/test_wal_segment_pool.c)
 target_link_libraries(test_wal_segment_pool PRIVATE wal)
 add_test(NAME test_wal_segment_pool COMMAND test_wal_segment_pool)
 
-# WAL Phase 3 — the 16MB ring buffer + txn_append_record LSN assignment
-# (MYDB_WAL_IMPLEMENTATION.md §8.6). No ATT/DPT, no Flusher thread yet.
-add_executable(test_wal_ring_buffer wal/test_wal_ring_buffer.c)
-target_link_libraries(test_wal_ring_buffer PRIVATE wal)
-add_test(NAME test_wal_ring_buffer COMMAND test_wal_ring_buffer)
-
-# WAL Phase 4 — the real Flusher thread (MYDB_WAL_DESIGN.md §7). The
-# first genuinely concurrent test in this codebase.
-add_executable(test_wal_flusher wal/test_wal_flusher.c)
-target_link_libraries(test_wal_flusher PRIVATE wal)
-add_test(NAME test_wal_flusher COMMAND test_wal_flusher)
+# WAL Phases 3 and 4 had test_wal_ring_buffer (the V1 16MB ring buffer)
+# and test_wal_flusher (the V1 Flusher thread, the first genuinely
+# concurrent test in this codebase). Both went with that code when V2
+# retired it; test_wal_insert / test_wal_flush replace them.
 
 # wal_mailbox — the shared background-thread + request/response queue
 # that wal_worker and LargeWalWriter's submit() (large_wal, now moved out)
@@ -66,10 +59,16 @@ add_executable(test_wal_worker wal/test_wal_worker.c)
 target_link_libraries(test_wal_worker PRIVATE wal)
 add_test(NAME test_wal_worker COMMAND test_wal_worker)
 
+# wal_insert — the V2 insert path (MYDB_WAL_DESIGN_V2.md §9, §10): block
+# counters, copy and publish, wal_insert, space check, concurrent inserts.
+add_executable(test_wal_insert wal/test_wal_insert.c)
+target_link_libraries(test_wal_insert PRIVATE wal)
+add_test(NAME test_wal_insert COMMAND test_wal_insert)
+
 # wal_manager (lifecycle/ownership; was normal_wal_manager, which mirrored
 # LargeWalManager, merged with the old top-level wal_manager): owns
-# WalWorker + WalRingBuffer + WalSegmentPool + WalFlusher, one init() call
-# brings all four up together.
+# WalWorker + WalSegmentPool (it also owned the V1 WalRingBuffer and
+# WalFlusher until V2 retired them), one init() call brings them up.
 add_executable(test_wal_manager wal/test_wal_manager.c)
 target_link_libraries(test_wal_manager PRIVATE wal)
 add_test(NAME test_wal_manager COMMAND test_wal_manager)

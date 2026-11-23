@@ -14,15 +14,18 @@
  * system-wide and lives in common.h — see the comment there for why the
  * split falls where it does).
  *
- * These structs are plain (not __attribute__((packed))), matching how
- * every other on-disk struct in this codebase works: the struct is a
- * convenience for callers to fill in field-by-field, not a layout the
- * code memcpy's onto disk directly. The real wire format is expressed by
- * wal_segment.c's serialize/deserialize functions, which read/write each
- * field at its own explicit byte offset (WAL_PAGE_HEADER_CHECKSUM_OFFSET
- * etc.) — the same *_OFFSET-constant pattern database_file.c/partition.c/
- * schema_file.c already use. So sizeof(WalRecordHeader) etc. is not
- * asserted anywhere to equal the documented on-disk byte count.
+ * These structs are plain (not __attribute__((packed))). Most on-disk
+ * structs in this codebase are only a convenience for callers to fill in
+ * field by field, and their wire format is written at explicit byte
+ * offsets (the *_OFFSET-constant pattern database_file.c/partition.c/
+ * schema_file.c use, and wal_segment.c / wal_page.c still do).
+ *
+ * WalRecordHeader is the exception: its on-disk layout was reordered so
+ * every field sits at an offset that is a multiple of its own size, which
+ * is exactly where the compiler puts it anyway. So the struct's first
+ * WAL_RECORD_HEADER_SIZE (44) bytes ARE the on-disk bytes, and
+ * wal_types.c copies them with one memcpy, as PostgreSQL does with
+ * XLogRecord. The _Static_asserts below the struct pin every offset.
  *
  * WAL_REC_INSERT / WAL_REC_DELETE bodies are genuinely variable-length
  * (slot_no, row_len, row_bytes) and are not given a struct here — they're
@@ -32,8 +35,23 @@
 
 /* ------------------------------------------------------------------
  * WalRecordHeader — on-disk shape is 44 bytes (MYDB_WAL_IMPLEMENTATION.md
- * §8.2); wire format is produced/consumed field-by-field, not via this
- * struct's in-memory layout.
+ * §8.2), the struct's own first 44 bytes:
+ *
+ *   lsn        0-7     prev_lsn   8-15    txn_id     16-23
+ *   total_len  24-27   table_id   28-31   page_no    32-35
+ *   rec_type   36      flags      37      reserved   38-39
+ *   checksum   40-43
+ *
+ * (The disk order used to put total_len at 16 and txn_id at 20, an
+ * 8-byte field at an offset that is not a multiple of 8, which no C
+ * struct can match without packing; so it was written field by field.)
+ *
+ * sizeof(WalRecordHeader) is 48, not 44: the struct's alignment is 8, so
+ * the compiler pads its end to a multiple of 8. Use WAL_RECORD_HEADER_SIZE
+ * (offsetof(checksum) + 4, like PostgreSQL's SizeOfXLogRecord) for the
+ * on-disk size, never sizeof. The bytes are in host byte order
+ * (little-endian on x86-64), as they already were with the per-field
+ * memcpy.
  * ------------------------------------------------------------------ */
 typedef struct {
     uint64_t lsn;              /* this record's LSN                       */
@@ -45,38 +63,38 @@ typedef struct {
     uint8_t  rec_type;         /* WalRecType, stored as a byte            */
     uint8_t  flags;            /* WAL_RECORD_FLAG_*                       */
     uint8_t  reserved[2];      /* was reserved[3]; one byte moved to flags */
-    uint32_t checksum;         /* CRC-32C over header + body              */
+    uint32_t checksum;         /* CRC-32C over body + header[0..40)       */
 } WalRecordHeader;
 
+/* The on-disk layout is the struct's layout: pin every offset, so moving
+ * or resizing a field fails the build instead of silently changing the
+ * format. */
+_Static_assert(offsetof(WalRecordHeader, lsn)       == 0,  "lsn at 0");
+_Static_assert(offsetof(WalRecordHeader, prev_lsn)  == 8,  "prev_lsn at 8");
+_Static_assert(offsetof(WalRecordHeader, txn_id)    == 16, "txn_id at 16");
+_Static_assert(offsetof(WalRecordHeader, total_len) == 24, "total_len at 24");
+_Static_assert(offsetof(WalRecordHeader, table_id)  == 28, "table_id at 28");
+_Static_assert(offsetof(WalRecordHeader, page_no)   == 32, "page_no at 32");
+_Static_assert(offsetof(WalRecordHeader, rec_type)  == 36, "rec_type at 36");
+_Static_assert(offsetof(WalRecordHeader, flags)     == 37, "flags at 37");
+_Static_assert(offsetof(WalRecordHeader, reserved)  == 38, "reserved at 38");
+_Static_assert(offsetof(WalRecordHeader, checksum)  == 40, "checksum at 40");
+_Static_assert(offsetof(WalRecordHeader, checksum) + sizeof(uint32_t) == WAL_RECORD_HEADER_SIZE,
+               "the on-disk header is the struct's first WAL_RECORD_HEADER_SIZE bytes");
+
 /* Set when this record's bytes do not all fit on the page its header
- * landed on — the remainder continues on the next page. LARGE_WAL set
- * it first (moved out of the tree); since T-039 wal_ring_buffer_append
- * sets it, before packing the header, whenever a record's last byte
- * lands on a later page than its first. It was stamped
- * by the LARGE_WAL writer at pack time (not by whoever
- * built the record), because whether a record spans depends on where it
- * lands, which only the writer knows — see
- * wal_record_header_patch_flags below. The ring buffer knows where a
+ * landed on — the remainder continues on the next page The ring buffer knows where a
  * record lands before it packs the header, so it sets the flag directly
- * and never needs patch_flags; the page header's OUT flag
- * (WAL_PAGE_OUTGOING_CONTINUATION) carries the same fact page-side. */
+ */
 #define WAL_RECORD_FLAG_CONTINUES_ON_NEW_PAGE 0x01
 
 /* ------------------------------------------------------------------
- * Serialize/deserialize + checksum. Added in Phase 3 (wal_ring_buffer.c
- * is the first real consumer) — deferred out of Phase 1 since there was
- * no file/frame I/O yet to serialize into.
- *
- * Unlike WalPageHeader/WalSegmentHeader (checksum over the header's own
- * fixed bytes only), WalRecordHeader.checksum covers header AND body —
+ * Serialize/deserialize + checksum.
+ * WalRecordHeader.checksum covers header AND body,
  * two regions that are not contiguous in the final on-disk layout
- * (checksum itself sits between them, at header offset 40). Both
- * functions used to build a small scratch buffer (header-minus-checksum
- * ++ body) to compute one CRC over that combined span; they now fold
- * the two spans in with crc32c_update (wal_types.c), so there is no
- * scratch and no size ceiling. serialize writes the real fixed layout
- * (header incl. checksum at its own offset, followed by body) into buf,
- * which must have room for WAL_RECORD_HEADER_SIZE + body_len bytes.
+ * (checksum itself sits between them, at header offset 40). The CRC
+ * runs over the body first and then the header's leading 40 bytes, so
+ * the body's part can be computed before the record has an LSN
  *
  * wal_record_header_serialize fills buf and stamps hdr->checksum too, so
  * callers who need to inspect what was written (e.g. its checksum or
@@ -90,29 +108,24 @@ typedef struct {
 void wal_record_header_serialize(WalRecordHeader *hdr, const void *body,
                                   size_t body_len, uint8_t *buf);
 
-/* Writes only the 44-byte header into out, with the checksum computed
- * over header + body, and stamps hdr->checksum. The body is read, never
- * copied. This is what the ring buffer uses (T-039): a record that spans
- * pages is never contiguous in the ring, so it packs the header here and
- * then copies header and body piece by piece across frames.
- * wal_record_header_serialize is this plus a memcpy of the body. */
-void wal_record_header_pack(WalRecordHeader *hdr, const void *body,
-                             size_t body_len, uint8_t out[WAL_RECORD_HEADER_SIZE]);
+/* Writes only the 44-byte header into out, with the checksum finished
+ * from body_checksum plus the header's leading 40 bytes, and stamps
+ * hdr->checksum. Caller sets every field of *hdr except checksum first.
+ *
+ * body_checksum is the CRC-32C running state over this record's body,
+ * not a finished checksum: crc32c_update(CRC32C_INIT, body, body_len),
+ * or CRC32C_INIT for a record with no body. The thread that builds the
+ * record computes it before calling insert (V2 §8.3), so the WAL only
+ * does the fixed 40 header bytes after reserving. */
+void wal_record_header_pack_crc(WalRecordHeader *hdr, uint32_t body_checksum,
+                                 uint8_t out[WAL_RECORD_HEADER_SIZE]);
+
+
+
 int  wal_record_header_deserialize(const uint8_t *buf, size_t body_len,
                                     WalRecordHeader *out);
 
-/* Rewrites the flags byte of an already-serialized 44-byte record
- * header and recomputes its checksum over header+body, so the record
- * still validates afterwards. body must point at that record's own
- * contiguous body bytes (body_len of them); it is read, never written.
- *
- * This existed for the LARGE_WAL writer (moved out; no caller today;
- * kept by decision in T-039), which learned only at pack time
- * whether a record will span a page, and must not mutate the caller's
- * const blob to record that: it patches a 44-byte copy of the header
- * and packs that instead of the original's first 44 bytes. */
-void wal_record_header_patch_flags(uint8_t *hdr_buf, const void *body,
-                                    size_t body_len, uint8_t flags);
+
 
 /* ------------------------------------------------------------------
  * Fixed-shape record bodies.

@@ -3,71 +3,80 @@
 
 #include <stdint.h>
 #include "common.h"
-#include "wal_ring_buffer.h"
 #include "wal_segment_pool.h"
-#include "wal_flusher.h"
 #include "wal_worker.h"
+#include "wal_frame_state.h"
 
 /*
- * wal_manager.h — owns every WAL sub-piece for one partition: the
- * WalWorker, the ring buffer, the segment pool and the Flusher. It is
- * the WAL's single front door. Lifecycle-and-ownership only, no
- * business-logic functions here — mostly composition of pieces that
- * already exist (WalWorker, WalRingBuffer, WalSegmentPool, WalFlusher),
- * no new logic.
+ * wal_manager.h — owns every WAL sub-piece for one partition. It is the
+ * WAL's single front door, Lifecycle and ownership
+ * here; the insert path will live in wal_insert.{h,c} and the write and
+ * flush path in wal_flush.{h,c}, both working on a WalManager *.
+
  *
- * This was normal_wal_manager.h, which mirrored LargeWalManager's shape
- * (large_wal/large_wal_manager.h), with a separate top-level wal_manager
- * owning the shared worker plus both subsystems' managers. Once records
- * were allowed to span pages and segments there was one log and no
- * large_wal, so the two layers were merged into this one and it took over
- * owning the worker (it used to only pass one through).
- *
- * Known, pre-existing, unrelated gap this inherits rather than solves:
- * wal_flusher_start()'s own doc comment already says it takes an
- * already-claimed slot and does no reload/resume logic of its own —
- * the WAL never got the equivalent of large_wal_writer_init's
- * find_or_claim_active() (scan for an already-ACTIVE slot on restart).
- * So init() here always claims a fresh segment, same limitation
- * WalFlusher already has today.
+ * Start-up finds the end of the log (wal_segment_pool_tail_scan) before
+ * anything else; only a brand-new log gets a fresh segment. ARIES
+ * redo/undo on top of that is the recovery piece's job.
  */
 
+/* Ring frames, a power of two (the ring frame of an LSN is a mask).
+ * 1024 frames = a 4MB ring. V2 leaves the default OPEN (§16, T-068). */
+#define WAL_RING_FRAMES 1024u
+_Static_assert((WAL_RING_FRAMES & (WAL_RING_FRAMES - 1)) == 0, "WAL_RING_FRAMES must be a power of two");
+
+/* Layout as V2 §5: fields nobody writes after init share the first cache
+ * line (no false sharing from fields that never change), and each hot
+ * atomic gets its own line: current_pos is hit by every insert,
+ * write_lsn by every space check that has to reload it.
+ *
+ * Because of the _Alignas(64) members the struct's alignment is 64. On
+ * the stack or as a global that is automatic; a heap-allocated
+ * WalManager (e.g. inside PartitionCtx later) must come from
+ * aligned_alloc(64, ...), since malloc only promises 16. */
 typedef struct {
-    WalWorker      worker;
-    WalRingBuffer  rb;
-    WalSegmentPool pool;
-    WalFlusher     flusher;
+    /* set at init, read-only after */
+    uint8_t         *ring_buf;        /* WAL_RING_FRAMES * 4KB, aligned 4096   */
+    WalBlockCounter *fs_counters;     /* one per 512B block, aligned 64, zeroed */
+    uint32_t         ring_buf_size;   /* frames, power of two                 */
+    uint32_t         ring_frame_mask; /* ring_buf_size - 1                    */
+    uint32_t         ctr_mask;        /* ring_buf_size * WAL_FRAME_BLOCKS - 1 */
+    uint32_t         partition_id;
+
+    /* hot atomics, one cache line each */
+    _Alignas(64) _Atomic uint64_t current_pos;  /* next reservation, in record bytes (V2 §4) */
+    _Alignas(64) _Atomic uint64_t write_lsn;    /* pwritten to the segment up to here       */
+
+    /* owned by whoever runs the write step (wal_flush); the pool and
+     * worker were here before V2 */
+    _Alignas(64) uint32_t curr_slot;    /* the active segment slot (V2 §5)      */
+    uint32_t              last_ctr_idx; /* the block the next write-step scan
+                                           starts at (V2 §10.2, §10.7)        */
+    WalSegmentPool        pool;
+    WalWorker             worker;
 } WalManager;
 
-/* wal_worker_start -> wal_segment_pool_init -> claim a fresh segment ->
- * wal_ring_buffer_init at that segment's first record
- * (wal_segment_first_lsn(segment_no)) -> wal_flusher_start(...,
- * &wm->worker), unwinding whatever already succeeded on any failure.
- * The ring used to be initialised first, always at LSN 0; now that the
- * LSN is a position in the log it has to start where the claimed segment
- * is, so the pool comes first. Each boot still starts a fresh segment
- * (resuming the old tail is the recovery/Analysis piece). The worker is
- * now a field of WalManager (it was a pass-through parameter): it is
- * handed to the Flusher so its write() calls can overlap a rollover's
- * two fsyncs (wal_worker.h). */
+
+
+/* wal_worker_start -> wal_segment_pool_init -> find the end of the log
+ * and resume there, unwinding whatever already succeeded on any failure:
+ *   - an existing log: wal_segment_pool_tail_scan finds the end and its
+ *     segment's slot (curr_slot), wal_segment_pool_truncate cuts the log
+ *     there (later segments discarded, everything after the end zeroed,
+ *     synced);
+ *   - a brand-new log (no ACTIVE segment): claim a fresh segment, whose
+ *     start is the end.
+ * Then allocates the ring (WAL_RING_FRAMES frames, 4096-aligned) and its
+ * block counters (64-aligned), both zeroed, and resumes at the end (V2
+ * §10.7): current_pos = record bytes before it, write_lsn = the end, the
+ * end's partial page copied into its ring frame, the counter of the
+ * end's block seeded with the bytes already in it, last_ctr_idx = that
+ * block. An end at a page's offset 24 resumes at the page's start (the
+ * next copier writes that header). Same path after a clean shutdown or a
+ * crash. ARIES redo/undo is the recovery piece, on top of this. */
 int wal_manager_init(WalManager *wm, const char *wal_dir, uint32_t partition_id);
 
-/* Appends one record (wal_ring_buffer_append). If the ring is full it
- * wakes the Flusher, waits for space (wal_ring_buffer_append_wait) and
- * tries again, so it only returns once the record is in the ring.
- * *out_lsn / *out_end_lsn are where it starts and just past its end.
- * Known gaps (T-039 part 1): a record bigger than the ring would wait
- * forever, and so would any append if the Flusher can never write. */
-int wal_manager_append(WalManager *wm, WalRecordHeader *hdr,
-                       const void *body, size_t body_len,
-                       uint64_t *out_lsn, uint64_t *out_end_lsn);
-
-/* Wakes the Flusher and blocks until everything before lsn is on disk
- * (pass a record's end LSN). The commit gate (design doc §11). */
-int wal_manager_wait_flushed(WalManager *wm, uint64_t lsn);
-
-/* Reverses init(): flusher_stop, segment_pool_shutdown,
- * ring_buffer_shutdown, worker_stop. Safe on a partially-initialised wm. */
+/* Reverses init(): frees the ring and counters, segment_pool_shutdown,
+ * worker_stop. Safe on a partially-initialised wm. */
 int wal_manager_shutdown(WalManager *wm);
 
 #endif /* WAL_MANAGER_H */

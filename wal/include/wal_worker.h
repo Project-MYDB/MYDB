@@ -8,7 +8,8 @@
 
 /*
  * wal_worker.h — one persistent background thread, owned by WalManager
- * (wal_manager.h) and handed to the Flusher, used to overlap a segment
+ * (wal_manager.h) and handed to whoever writes segments (the V1 Flusher
+ * until it was retired; V2's write step in wal_flush next), used to overlap a segment
  * rollover's two genuinely
  * distinct-file fsyncs instead of paying for them sequentially.
  *
@@ -63,8 +64,9 @@
  * found an empty mailbox and read success — a failed WAL fsync reported
  * as durable.
  *
- * With large_wal moved out, the Flusher is the only caller thread today,
- * so the collision cannot happen right now. The tickets stay: they cost
+ * With large_wal moved out and the V1 Flusher retired, there is no caller
+ * thread today; V2's write step will be the one, so the collision cannot
+ * happen right now. The tickets stay: they cost
  * nothing, and any second caller (a checkpointer, an archiver) brings
  * the same hazard straight back.
  * ------------------------------------------------------------------
@@ -85,8 +87,8 @@ int wal_worker_stop(WalWorker *w);
 /* Hands fd off to the background thread for fdatasync() and returns
  * immediately. Blocks only if a previous request hasn't been wait()'d
  * on yet (a collision between two caller threads sharing this one
- * worker; there were two while large_wal existed, the Flusher is the
- * only one now) — otherwise returns without
+ * worker; there were two while large_wal existed, then only the V1
+ * Flusher, and V2's write step will be the next) — otherwise returns without
  * waiting for the fdatasync itself to complete.
  *
  * out_ticket (may be NULL) receives the number naming this request.
