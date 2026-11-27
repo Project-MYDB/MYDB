@@ -3,23 +3,11 @@
 
 #include <string.h>
 
-/*
- * Field-by-field memcpy throughout, not a whole-struct memcpy through a
- * cast buf pointer — same reasoning file_header.c already documents:
- * avoids alignment assumptions about caller-provided buffers.
- *
- * Caller sets every field of *hdr except checksum before calling
- * wal_page_header_serialize(); id.magic/id.version are overwritten
- * internally via file_header_write_id() regardless of what the caller
- * put there (only id.file_type is actually read from *hdr) — the same
- * contract every other on-disk struct in this codebase follows.
- */
+/* Fields are copied one by one at fixed offsets, so buf needs no
+ * alignment. serialize writes magic and version itself; of hdr->id it
+ * reads only file_type. */
 
-/* WalPageHeader — 24 bytes. Checksum covers the 20 bytes preceding it
- * (id[8] + start_lsn[8] + continuation_len[2] + flags[1] + reserved[1]).
- * Was id + start_lsn + end_lsn[8] + data_len + flags + reserved[1] before
- * end_lsn was dropped (T-039), then 32 bytes with data_len[2] and
- * reserved[7] until data_len was dropped too. */
+/* The checksum covers the 20 bytes before it. */
 #define WAL_PAGE_HEADER_CHECKSUM_OFFSET 20
 
 void wal_page_header_serialize(const WalPageHeader *hdr, uint8_t *buf)

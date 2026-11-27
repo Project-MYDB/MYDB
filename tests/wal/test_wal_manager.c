@@ -45,7 +45,7 @@ static void test_init_and_shutdown_bring_up_all_subpieces(void)
     memset(&wm, 0, sizeof(wm));
     CHECK(wal_manager_init(&wm, TEST_WAL_DIR, 1) == MYDB_OK,
           "a single init() call brings up the worker + pool and claims a segment");
-    CHECK(wm.worker.mb.started == 1, "the worker thread was started as part of init()");
+    CHECK(wm.worker.started == 1, "the worker thread was started as part of init()");
     CHECK(wm.curr_slot < WAL_SEGMENT_POOL_SLOTS &&
           wm.pool.slots[wm.curr_slot].header.state == SEG_ACTIVE,
           "init() claimed an active segment into curr_slot");
@@ -56,7 +56,7 @@ static void test_init_and_shutdown_bring_up_all_subpieces(void)
           "on a fresh directory that is segment 0, first record at LSN 24 (V2 rule 6)");
 
     CHECK(wal_manager_shutdown(&wm) == MYDB_OK, "shutdown() succeeds cleanly");
-    CHECK(wm.worker.mb.started == 0, "the worker thread was stopped by shutdown()");
+    CHECK(wm.worker.started == 0, "the worker thread was stopped by shutdown()");
 
     cleanup();
 }
@@ -74,8 +74,8 @@ static void test_insert_fields(void)
     memset(&wm, 0, sizeof(wm));
     CHECK(wal_manager_init(&wm, TEST_WAL_DIR, 7) == MYDB_OK, "init succeeds");
 
-    CHECK(wm.ring_buf_size == 1024 && wm.ring_frame_mask == 1023 && wm.ctr_mask == 8191,
-          "a 4 MB ring: 1024 frames, frame mask 1023, ctr_mask 8191");
+    CHECK(wm.ring_buf_size == 2048 && wm.ring_frame_mask == 2047 && wm.ctr_mask == 16383,
+          "an 8 MB ring: 2048 frames, frame mask 2047, ctr_mask 16383");
     CHECK(wm.partition_id == 7, "partition_id stored");
     CHECK(wm.ring_buf && ((uintptr_t)wm.ring_buf % 4096) == 0, "ring_buf is 4096-aligned");
     CHECK(wm.fs_counters && ((uintptr_t)wm.fs_counters % 64) == 0,
@@ -84,7 +84,7 @@ static void test_insert_fields(void)
     int all_zero = 1;
     for (uint32_t i = 0; i <= wm.ctr_mask; i++)
         if (atomic_load(&wm.fs_counters[i].done) != 0) { all_zero = 0; break; }
-    CHECK(all_zero, "all 8192 counters start at zero");
+    CHECK(all_zero, "all 16384 counters start at zero");
 
     CHECK(offsetof(WalManager, current_pos) % 64 == 0 &&
           offsetof(WalManager, write_lsn) % 64 == 0 &&
@@ -99,9 +99,8 @@ static void test_insert_fields(void)
     CHECK(wal_manager_shutdown(&wm) == MYDB_OK && wm.ring_buf == NULL && wm.fs_counters == NULL,
           "shutdown frees the ring and counters");
 
-    /* Same directory again: segment 0 is still ACTIVE on disk, so this
-     * is not a brand-new log. init resumes it (it used to claim segment 1
-     * here): segment 0 is unwritten, so the end is LSN 0, as before. */
+    /* Same directory again: segment 0 is still ACTIVE, so init resumes
+     * it, and with nothing written the end is LSN 0. */
     memset(&wm, 0, sizeof(wm));
     CHECK(wal_manager_init(&wm, TEST_WAL_DIR, 7) == MYDB_OK &&
           wm.pool.slots[wm.curr_slot].header.segment_no == 0,
@@ -255,10 +254,10 @@ static void test_resume_in_the_previous_segment(void)
     wal_segment_pool_write_page(&resume_pool, s1, 1, zero);          /* its tail never landed */
     TestLog later;                                                   /* but a later page of it did */
     tl_begin(&later, 1, 0);
-    later.pos = (1ull << 22) + 4096;
+    later.pos = (uint64_t)WAL_SEG_SIZE + 4096;
     tl_record(&later, 100, 0x44);
     wal_segment_pool_write_page(&resume_pool, s1, 2, later.img + 4096);
-    wal_segment_pool_mark_done(&resume_pool, NULL, s0, 1ull << 22, 1024, NULL);
+    wal_segment_pool_mark_done(&resume_pool, s0, WAL_SEG_SIZE, WAL_SEG_PAGES);
     wal_segment_pool_shutdown(&resume_pool);
 
     memset(&wm, 0, sizeof(wm));

@@ -1,13 +1,14 @@
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <pthread.h>
 
 #include "common.h"
+#include "wal_page.h"
 #include "wal_worker.h"
 
-#define TEST_FILE "/tmp/mydb_test_wal_worker.tmp"
+#define TEST_WAL_DIR "/tmp/mydb_test_wal_worker"
+#define SEG(n) ((uint64_t)(n) << WAL_SEG_SHIFT)
 
 static int tests_run    = 0;
 static int tests_passed = 0;
@@ -18,185 +19,162 @@ static int tests_passed = 0;
     else       { printf("  FAIL: %s (line %d)\n", msg, __LINE__); } \
 } while(0)
 
+/* A pool with segments 0..3 claimed, and a flush_lock over flushed. */
+typedef struct {
+    WalSegmentPool     pool;
+    WalGroupCommitLock flush_lock;
+    _Atomic uint64_t   flushed;
+} Rig;
+
+static void cleanup(void)
+{
+    char path[300];
+    for (uint32_t i = 0; i < WAL_SEGMENT_POOL_SLOTS; i++) {
+        snprintf(path, sizeof(path), "%s/wal_%u.mydb", TEST_WAL_DIR, i);
+        unlink(path);
+    }
+    rmdir(TEST_WAL_DIR);
+}
+
+static int rig_up(Rig *r)
+{
+    cleanup();
+    atomic_init(&r->flushed, 0);
+    if (wal_segment_pool_init(&r->pool, TEST_WAL_DIR, 1) != MYDB_OK) return MYDB_ERR;
+    for (int i = 0; i < 4; i++) {
+        uint32_t slot;
+        if (wal_segment_pool_claim_next(&r->pool, &slot) != MYDB_OK) return MYDB_ERR;
+    }
+    return wal_gcl_init(&r->flush_lock, &r->flushed);
+}
+
+static void rig_down(Rig *r)
+{
+    wal_gcl_destroy(&r->flush_lock);
+    wal_segment_pool_shutdown(&r->pool);
+    cleanup();
+}
+
+/* Polls *v until it reaches want, for up to 2 s. */
+static int reaches(_Atomic uint64_t *v, uint64_t want)
+{
+    struct timespec ts = { 0, 1000000 };
+    for (int i = 0; i < 2000; i++) {
+        if (atomic_load(v) >= want) return 1;
+        nanosleep(&ts, NULL);
+    }
+    return atomic_load(v) >= want;
+}
+
 static void test_start_stop(void)
 {
     printf("\n[test_start_stop]\n");
+    Rig r;
+    CHECK(rig_up(&r) == MYDB_OK, "rig set up");
 
     WalWorker w;
-    CHECK(wal_worker_start(&w) == MYDB_OK, "start succeeds");
+    CHECK(wal_worker_start(&w, &r.pool, &r.flush_lock, 0) == MYDB_OK, "start succeeds");
+    CHECK(w.started, "started is set");
     CHECK(wal_worker_stop(&w) == MYDB_OK, "stop succeeds");
-    CHECK(wal_worker_stop(&w) == MYDB_OK, "calling stop() a second time is a harmless no-op");
+    CHECK(!w.started, "started is cleared");
+    CHECK(wal_worker_stop(&w) == MYDB_OK, "a second stop is a no-op");
+
+    rig_down(&r);
 }
 
-static void test_wait_with_ticket_zero_is_a_noop(void)
+static void test_sync_publishes_flushed(void)
 {
-    printf("\n[test_wait_with_ticket_zero_is_a_noop]\n");
+    printf("\n[test_sync_publishes_flushed]\n");
+    Rig r;
+    rig_up(&r);
 
     WalWorker w;
-    wal_worker_start(&w);
+    wal_worker_start(&w, &r.pool, &r.flush_lock, 0);
 
-    CHECK(wal_worker_wait(&w, 0) == MYDB_OK,
-          "wait() with ticket 0 is a cheap no-op -- this caller posted nothing");
+    wal_worker_request_sync(&w, SEG(1));
+    CHECK(reaches(&w.synced_lsn, SEG(1)), "synced_lsn reaches the end of segment 0");
+    CHECK(reaches(&r.flushed, SEG(1)), "with flush_lock free, flushed_lsn follows");
+
+    wal_worker_request_sync(&w, SEG(3));
+    CHECK(reaches(&w.synced_lsn, SEG(3)), "a request two segments ahead syncs both");
+    CHECK(reaches(&r.flushed, SEG(3)), "flushed_lsn follows again");
+
+    wal_worker_request_sync(&w, SEG(2));
+    CHECK(wal_worker_stop(&w) == MYDB_OK, "a request behind synced_lsn is harmless");
+    CHECK(atomic_load(&w.synced_lsn) == SEG(3), "synced_lsn did not move");
+    CHECK(atomic_load(&r.flushed) == SEG(3), "flushed_lsn did not move");
+
+    rig_down(&r);
+}
+
+static void test_lock_held_skips_flushed(void)
+{
+    printf("\n[test_lock_held_skips_flushed]\n");
+    Rig r;
+    rig_up(&r);
+
+    WalWorker w;
+    wal_worker_start(&w, &r.pool, &r.flush_lock, 0);
+
+    /* The test plays a commit leader holding flush_lock. */
+    CHECK(wal_gcl_acquire(&r.flush_lock, SEG(4)) == WAL_GCL_ACQUIRED, "test holds flush_lock");
+
+    wal_worker_request_sync(&w, SEG(2));
+    CHECK(reaches(&w.synced_lsn, SEG(2)), "the worker syncs without the lock");
+    usleep(20000);
+    CHECK(atomic_load(&r.flushed) == 0, "it leaves flushed_lsn to the lock holder");
+
+    wal_gcl_release(&r.flush_lock, SEG(1));
+    CHECK(atomic_load(&r.flushed) == SEG(1), "the holder's release publishes");
+
+    wal_worker_request_sync(&w, SEG(3));
+    CHECK(reaches(&r.flushed, SEG(3)), "with the lock free again, the worker publishes");
 
     wal_worker_stop(&w);
+    rig_down(&r);
 }
 
-static void test_async_fdatasync_round_trip(void)
+static void test_stop_serves_request(void)
 {
-    printf("\n[test_async_fdatasync_round_trip]\n");
-
-    int fd = open(TEST_FILE, O_CREAT | O_RDWR, 0644);
-    CHECK(fd >= 0, "test file opened");
-
-    uint8_t buf[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
-    CHECK(write(fd, buf, sizeof(buf)) == (ssize_t)sizeof(buf), "wrote some bytes to sync");
+    printf("\n[test_stop_serves_request]\n");
+    Rig r;
+    rig_up(&r);
 
     WalWorker w;
-    wal_worker_start(&w);
+    wal_worker_start(&w, &r.pool, &r.flush_lock, 0);
+    wal_worker_request_sync(&w, SEG(4));
+    CHECK(wal_worker_stop(&w) == MYDB_OK, "stop right after a request succeeds");
+    CHECK(atomic_load(&w.synced_lsn) == SEG(4), "the request was served before exit");
+    CHECK(atomic_load(&r.flushed) == SEG(4), "and published");
 
-    uint64_t ticket = 0;
-    CHECK(wal_worker_async_fdatasync(&w, fd, &ticket) == MYDB_OK, "async_fdatasync accepted");
-    CHECK(ticket != 0, "a successful post hands back a non-zero ticket");
-    CHECK(wal_worker_wait(&w, ticket) == MYDB_OK, "wait() returns the fdatasync's result");
-
-    wal_worker_stop(&w);
-    close(fd);
-    unlink(TEST_FILE);
+    rig_down(&r);
 }
 
-static void test_back_to_back_submissions(void)
+static void test_failed_sync(void)
 {
-    printf("\n[test_back_to_back_submissions]\n");
+    printf("\n[test_failed_sync]\n");
+    Rig r;
+    rig_up(&r);
 
-    int fd = open(TEST_FILE, O_CREAT | O_RDWR, 0644);
+    int saved = r.pool.slots[1].fd;
+    r.pool.slots[1].fd = -1;   /* segment 1's fdatasync fails */
 
     WalWorker w;
-    wal_worker_start(&w);
+    wal_worker_start(&w, &r.pool, &r.flush_lock, 0);
+    wal_worker_request_sync(&w, SEG(3));
 
-    int all_ok = 1, tickets_rise = 1;
-    uint64_t prev = 0;
-    for (int i = 0; i < 20; i++) {
-        uint64_t t = 0;
-        if (wal_worker_async_fdatasync(&w, fd, &t) != MYDB_OK) all_ok = 0;
-        if (t <= prev) tickets_rise = 0;
-        prev = t;
-        if (wal_worker_wait(&w, t) != MYDB_OK) all_ok = 0;
+    int seen = 0;
+    for (int i = 0; i < 2000 && !seen; i++) {
+        seen = atomic_load(&w.io_error);
+        if (!seen) usleep(1000);
     }
-    CHECK(all_ok, "20 sequential submit+wait round trips from the same thread all succeed");
-    CHECK(tickets_rise, "each post hands back a strictly higher ticket than the last");
+    CHECK(seen, "io_error is set");
+    CHECK(atomic_load(&w.synced_lsn) == SEG(1), "synced_lsn stops before the failed segment");
+    CHECK(atomic_load(&r.flushed) == 0, "nothing is published after a failure");
+    CHECK(wal_worker_stop(&w) == MYDB_ERR, "stop reports the failure");
 
-    wal_worker_stop(&w);
-    close(fd);
-    unlink(TEST_FILE);
-}
-
-/* ------------------------------------------------------------------
- * One worker, two caller threads -- the shape production had while
- * large_wal existed (the Flusher thread and the LargeWalWriter thread
- * shared one WalWorker), and the one any second caller brings back.
- * BOTH call wait() unconditionally at the end of
- * every write(), whether or not that particular call rolled over and
- * posted anything.
- *
- * The fsync here is deliberately made to fail (fd -1 -> EBADF) so the
- * two outcomes are told apart by their VALUE, not just by timing:
- * the thread that posted must get the error, the thread that posted
- * nothing must get MYDB_OK. Before the ticket, they came out swapped.
- * ------------------------------------------------------------------ */
-
-typedef struct {
-    WalWorker      *w;
-    uint64_t        ticket;
-    int             post_rc;
-    int             wait_rc;
-    pthread_mutex_t m;
-    pthread_cond_t  c;
-    int             posted;        /* poster has handed its fsync over  */
-    int             bystander_done;/* bystander has finished its wait() */
-} ShareCtx;
-
-static void *poster_main(void *arg)
-{
-    ShareCtx *s = (ShareCtx *)arg;
-
-    s->post_rc = wal_worker_async_fdatasync(s->w, -1, &s->ticket);
-
-    pthread_mutex_lock(&s->m);
-    s->posted = 1;
-    pthread_cond_broadcast(&s->c);
-    while (!s->bystander_done)
-        pthread_cond_wait(&s->c, &s->m);
-    pthread_mutex_unlock(&s->m);
-
-    /* Collected only after the bystander has had its turn, so if the
-     * bystander consumed this result the failure shows up right here. */
-    s->wait_rc = wal_worker_wait(s->w, s->ticket);
-    return NULL;
-}
-
-static void test_result_is_not_stolen_by_the_other_caller(void)
-{
-    printf("\n[test_result_is_not_stolen_by_the_other_caller]\n");
-
-    WalWorker w;
-    wal_worker_start(&w);
-
-    ShareCtx s;
-    memset(&s, 0, sizeof(s));
-    s.w = &w;
-    pthread_mutex_init(&s.m, NULL);
-    pthread_cond_init(&s.c, NULL);
-
-    pthread_t poster;
-    pthread_create(&poster, NULL, poster_main, &s);
-
-    pthread_mutex_lock(&s.m);
-    while (!s.posted)
-        pthread_cond_wait(&s.c, &s.m);
-    pthread_mutex_unlock(&s.m);
-
-    /* The bystander: it never posted, so it passes ticket 0. The other
-     * thread's fsync may be in flight or already finished -- either way
-     * this call must not touch it. */
-    int bystander_rc = wal_worker_wait(&w, 0);
-
-    pthread_mutex_lock(&s.m);
-    s.bystander_done = 1;
-    pthread_cond_broadcast(&s.c);
-    pthread_mutex_unlock(&s.m);
-
-    pthread_join(poster, NULL);
-
-    CHECK(s.post_rc == MYDB_OK, "the posting thread's async_fdatasync was accepted");
-    CHECK(bystander_rc == MYDB_OK,
-          "a thread that posted nothing collects nothing, even with another fsync in flight");
-    CHECK(s.wait_rc == MYDB_ERR,
-          "the posting thread gets its OWN fsync's failure, not an empty mailbox");
-
-    pthread_cond_destroy(&s.c);
-    pthread_mutex_destroy(&s.m);
-    wal_worker_stop(&w);
-}
-
-static void test_double_wait_on_a_spent_ticket_is_rejected(void)
-{
-    printf("\n[test_double_wait_on_a_spent_ticket_is_rejected]\n");
-
-    int fd = open(TEST_FILE, O_CREAT | O_RDWR, 0644);
-
-    WalWorker w;
-    wal_worker_start(&w);
-
-    uint64_t ticket = 0;
-    wal_worker_async_fdatasync(&w, fd, &ticket);
-
-    CHECK(wal_worker_wait(&w, ticket) == MYDB_OK, "the first wait collects the result");
-    CHECK(wal_worker_wait(&w, ticket) == MYDB_ERR,
-          "waiting on the same ticket twice is rejected rather than silently succeeding");
-
-    wal_worker_stop(&w);
-    close(fd);
-    unlink(TEST_FILE);
+    r.pool.slots[1].fd = saved;
+    rig_down(&r);
 }
 
 int main(void)
@@ -204,11 +182,10 @@ int main(void)
     printf("=== test_wal_worker ===\n");
 
     test_start_stop();
-    test_wait_with_ticket_zero_is_a_noop();
-    test_async_fdatasync_round_trip();
-    test_back_to_back_submissions();
-    test_result_is_not_stolen_by_the_other_caller();
-    test_double_wait_on_a_spent_ticket_is_rejected();
+    test_sync_publishes_flushed();
+    test_lock_held_skips_flushed();
+    test_stop_serves_request();
+    test_failed_sync();
 
     printf("\nResults: %d/%d passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

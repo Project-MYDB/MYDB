@@ -1,12 +1,13 @@
 #include "wal_insert.h"
+#include "wal_flush.h"
 #include "wal_types.h"
 
 #include <assert.h>
-#include <sched.h>
 #include <stdatomic.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 _Static_assert(WAL_PAGE_USABLE <= UINT16_MAX, "continuation_len is a uint16_t");
 
@@ -21,7 +22,6 @@ static uint32_t record_len_at(const uint8_t *rec)
 uint64_t wal_insert_reserve(WalManager *wm, uint32_t len)
 {
     /* Relaxed: the add only hands out the range. */
-
     return atomic_fetch_add_explicit(&wm->current_pos, len, memory_order_relaxed);
 }
 
@@ -34,8 +34,7 @@ uint64_t wal_insert_fill_headers(uint8_t *buf, uint32_t len,
         WalRecordHeader h;
         memcpy(&h, buf + off, WAL_RECORD_HEADER_SIZE);
 
-        /* A record is at least its header, for debug builds only. */
-        assert(h.total_len >= WAL_RECORD_HEADER_SIZE);
+        assert(h.total_len >= WAL_RECORD_HEADER_SIZE);   /* checked by the caller */
 
         h.lsn      = wal_byte_to_lsn(byte_pos + off);
         h.prev_lsn = prev_lsn;
@@ -76,15 +75,13 @@ void wal_insert_plan(const WalManager *wm, WalByteInsert *p, uint64_t lsn,
         while (p->rec_end <= off) {
             uint32_t rec_len = record_len_at(buf + p->rec_end);
 
-            /* A record is at least its header, for debug builds only. */
             assert(rec_len >= WAL_RECORD_HEADER_SIZE);
 
             p->rec_start = p->rec_end;
             p->rec_end  += rec_len;
         }
 
-        /* Only facts this copier knows, so the header is written once and
-         * never changes (V2 §8.2). */
+        /* Only what this copier knows, so the header never changes. */
         WalPageHeader h = {0};
         h.id.file_type = FILETYPE_WAL_PAGE;
         h.start_lsn    = lsn - WAL_PAGE_HEADER_SIZE;
@@ -124,42 +121,32 @@ void wal_insert_copy(WalManager *wm, const WalByteInsert *p)
                                   memory_order_release);
 }
 
-/* Interim wait until write_lsn reaches target: spin, then yield, then
- * sleep. The flush piece replaces it with running the write step here. */
-static void wait_write_lsn(WalManager *wm, uint64_t target, uint64_t *write_lsn_cached)
-{
-    for (uint32_t tries = 0; ; tries++) {
-        *write_lsn_cached = atomic_load_explicit(&wm->write_lsn, memory_order_acquire);
-        if (*write_lsn_cached >= target) return;
-
-        if (tries < 64)        continue;
-        else if (tries < 128)  sched_yield();
-        else                   nanosleep(&(struct timespec){ .tv_nsec = 50000 }, NULL);
-    }
-}
-
 void wal_insert_space_check(WalManager *wm, uint64_t end_lsn, uint64_t *write_lsn_cached)
 {
     uint64_t ring_size_bytes = (uint64_t)wm->ring_buf_size << WAL_PAGE_SHIFT;
     uint64_t space_required      = (end_lsn + WAL_BLOCK_SIZE - 1) & ~(uint64_t)(WAL_BLOCK_SIZE - 1);
 
-    /* space_required <= write_lsn + ring_size_bytes, written as an add:
-     * space_required - ring_size_bytes would wrap below zero for the
-     * ring's first lap. */
+    /* Compared as an add: a subtraction would wrap on the first lap. */
     if (space_required <= *write_lsn_cached + ring_size_bytes) return;   /* the session's copy */
 
-    /* Acquire: the write step zeroes the blocks it passed before publishing
-     * write_lsn, so the copy after this sees them zeroed. */
+    /* Acquire: the write step zeroed the passed blocks before publishing. */
     *write_lsn_cached = atomic_load_explicit(&wm->write_lsn, memory_order_acquire);
     if (space_required <= *write_lsn_cached + ring_size_bytes) return;
 
-    wait_write_lsn(wm, space_required - ring_size_bytes, write_lsn_cached);
+    /* Not free: write the ring out. A failed write is fatal, as in
+     * PostgreSQL: these reserved bytes could never be copied, and every
+     * commit after them would wait forever. */
+    if (wal_flush_space_wait(wm, space_required - ring_size_bytes) != MYDB_OK) {
+        fprintf(stderr, "mydb: WAL write failed while waiting for ring space\n");
+        abort();
+    }
+    *write_lsn_cached = atomic_load_explicit(&wm->write_lsn, memory_order_acquire);
 }
 
 int wal_insert(WalManager *wm, uint8_t *buf, uint32_t len, uint64_t prev_lsn,
                uint64_t *write_lsn_cached, uint64_t *out_last_lsn, uint64_t *out_end_lsn)
 {
-    /* Before the reservation, the last point where failing is possible. */
+    /* Only before the reservation can this fail. */
     if (!wm || !buf || !write_lsn_cached || !out_last_lsn || !out_end_lsn ||
         len < WAL_RECORD_HEADER_SIZE)
         return MYDB_ERR;

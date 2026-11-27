@@ -6,53 +6,24 @@
 #include "common.h"
 
 /*
- * wal_types.h — WAL record header + fixed-shape record body layouts
- * (MYDB_WAL_DESIGN.md §8.3/§8.4, MYDB_WAL_IMPLEMENTATION.md §8.2/§8.5,
- * §8.7, §10.5).
+ * wal_types.h — the log record header and the fixed-shape record bodies.
  *
- * WalRecordHeader is wal/'s own struct (unlike WalRecType, which is
- * system-wide and lives in common.h — see the comment there for why the
- * split falls where it does).
- *
- * These structs are plain (not __attribute__((packed))). Most on-disk
- * structs in this codebase are only a convenience for callers to fill in
- * field by field, and their wire format is written at explicit byte
- * offsets (the *_OFFSET-constant pattern database_file.c/partition.c/
- * schema_file.c use, and wal_segment.c / wal_page.c still do).
- *
- * WalRecordHeader is the exception: its on-disk layout was reordered so
- * every field sits at an offset that is a multiple of its own size, which
- * is exactly where the compiler puts it anyway. So the struct's first
- * WAL_RECORD_HEADER_SIZE (44) bytes ARE the on-disk bytes, and
- * wal_types.c copies them with one memcpy, as PostgreSQL does with
- * XLogRecord. The _Static_asserts below the struct pin every offset.
- *
- * WAL_REC_INSERT / WAL_REC_DELETE bodies are genuinely variable-length
- * (slot_no, row_len, row_bytes) and are not given a struct here — they're
- * packed by hand at the call site, the same way every other
- * variable-length row body in this codebase is.
+ * Every field of WalRecordHeader sits at an offset that is a multiple of
+ * its size, so the struct's first WAL_RECORD_HEADER_SIZE (44) bytes are
+ * the on-disk bytes and are copied with one memcpy, as PostgreSQL does
+ * with XLogRecord. The _Static_asserts below pin every offset.
+ * INSERT and DELETE bodies are variable-length and packed by hand.
  */
 
-/* ------------------------------------------------------------------
- * WalRecordHeader — on-disk shape is 44 bytes (MYDB_WAL_IMPLEMENTATION.md
- * §8.2), the struct's own first 44 bytes:
+/* The header in front of every log record, 44 bytes on disk:
  *
  *   lsn        0-7     prev_lsn   8-15    txn_id     16-23
  *   total_len  24-27   table_id   28-31   page_no    32-35
  *   rec_type   36      flags      37      reserved   38-39
  *   checksum   40-43
  *
- * (The disk order used to put total_len at 16 and txn_id at 20, an
- * 8-byte field at an offset that is not a multiple of 8, which no C
- * struct can match without packing; so it was written field by field.)
- *
- * sizeof(WalRecordHeader) is 48, not 44: the struct's alignment is 8, so
- * the compiler pads its end to a multiple of 8. Use WAL_RECORD_HEADER_SIZE
- * (offsetof(checksum) + 4, like PostgreSQL's SizeOfXLogRecord) for the
- * on-disk size, never sizeof. The bytes are in host byte order
- * (little-endian on x86-64), as they already were with the per-field
- * memcpy.
- * ------------------------------------------------------------------ */
+ * sizeof is 48 (end padding to 8), so use WAL_RECORD_HEADER_SIZE for the
+ * on-disk size. Host byte order. */
 typedef struct {
     uint64_t lsn;              /* this record's LSN                       */
     uint64_t prev_lsn;         /* previous LSN for this txn (0 = first)   */
@@ -62,13 +33,12 @@ typedef struct {
     uint32_t page_no;
     uint8_t  rec_type;         /* WalRecType, stored as a byte            */
     uint8_t  flags;            /* WAL_RECORD_FLAG_*                       */
-    uint8_t  reserved[2];      /* was reserved[3]; one byte moved to flags */
+    uint8_t  reserved[2];
     uint32_t checksum;         /* CRC-32C over body + header[0..40)       */
 } WalRecordHeader;
 
-/* The on-disk layout is the struct's layout: pin every offset, so moving
- * or resizing a field fails the build instead of silently changing the
- * format. */
+/* Moving or resizing a field fails the build instead of changing the
+ * on-disk format. */
 _Static_assert(offsetof(WalRecordHeader, lsn)       == 0,  "lsn at 0");
 _Static_assert(offsetof(WalRecordHeader, prev_lsn)  == 8,  "prev_lsn at 8");
 _Static_assert(offsetof(WalRecordHeader, txn_id)    == 16, "txn_id at 16");
@@ -82,50 +52,30 @@ _Static_assert(offsetof(WalRecordHeader, checksum)  == 40, "checksum at 40");
 _Static_assert(offsetof(WalRecordHeader, checksum) + sizeof(uint32_t) == WAL_RECORD_HEADER_SIZE,
                "the on-disk header is the struct's first WAL_RECORD_HEADER_SIZE bytes");
 
-/* Set when this record's bytes do not all fit on the page its header
- * landed on — the remainder continues on the next page The ring buffer knows where a
- * record lands before it packs the header, so it sets the flag directly
- */
+/* The record does not fit on the page its header is on and continues on
+ * the next page. Not set for a record that ends exactly at the page end. */
 #define WAL_RECORD_FLAG_CONTINUES_ON_NEW_PAGE 0x01
 
-/* ------------------------------------------------------------------
- * Serialize/deserialize + checksum.
- * WalRecordHeader.checksum covers header AND body,
- * two regions that are not contiguous in the final on-disk layout
- * (checksum itself sits between them, at header offset 40). The CRC
- * runs over the body first and then the header's leading 40 bytes, so
- * the body's part can be computed before the record has an LSN
- *
- * wal_record_header_serialize fills buf and stamps hdr->checksum too, so
- * callers who need to inspect what was written (e.g. its checksum or
- * lsn; it used to be a frame's new end_lsn, a page header field dropped in
- * T-039) can read it straight back off *hdr without re-parsing buf.
- * Caller sets every field of *hdr except checksum first.
- *
- * wal_record_header_deserialize validates the checksum before filling
- * *out. Returns MYDB_OK or MYDB_ERR_BAD_CHECKSUM.
- * ------------------------------------------------------------------ */
+/* The checksum is CRC-32C over the body, then the header's first 40
+ * bytes. Body first, so the body's part can be computed before the record
+ * has an LSN (V2 §8.3). */
+
+/* Writes the header and the body into buf and stamps hdr->checksum. The
+ * caller sets every field but checksum. */
 void wal_record_header_serialize(WalRecordHeader *hdr, const void *body,
                                   size_t body_len, uint8_t *buf);
 
-/* Writes only the 44-byte header into out, with the checksum finished
- * from body_checksum plus the header's leading 40 bytes, and stamps
- * hdr->checksum. Caller sets every field of *hdr except checksum first.
- *
- * body_checksum is the CRC-32C running state over this record's body,
- * not a finished checksum: crc32c_update(CRC32C_INIT, body, body_len),
- * or CRC32C_INIT for a record with no body. The thread that builds the
- * record computes it before calling insert (V2 §8.3), so the WAL only
- * does the fixed 40 header bytes after reserving. */
+/* Writes only the 44-byte header into out, finishing the checksum from
+ * body_checksum, and stamps hdr->checksum. body_checksum is the running
+ * CRC state over the body, crc32c_update(CRC32C_INIT, body, len), or
+ * CRC32C_INIT for no body: the session computes it before wal_insert. */
 void wal_record_header_pack_crc(WalRecordHeader *hdr, uint32_t body_checksum,
                                  uint8_t out[WAL_RECORD_HEADER_SIZE]);
 
-
-
+/* Checks the checksum over the header and the body_len bytes after it,
+ * then fills *out. Returns MYDB_OK or MYDB_ERR_BAD_CHECKSUM. */
 int  wal_record_header_deserialize(const uint8_t *buf, size_t body_len,
                                     WalRecordHeader *out);
-
-
 
 /* ------------------------------------------------------------------
  * Fixed-shape record bodies.
@@ -136,7 +86,7 @@ typedef struct {
     uint64_t commit_timestamp;
 } WalRecCommitBody;
 
-/* WAL_REC_CLR body — makes Undo crash-safe and resumable.
+/* WAL_REC_CLR body: makes undo resumable after a crash.
  * next_undo_lsn == 0 means the transaction is fully undone. */
 typedef struct {
     uint64_t undone_lsn;
@@ -144,11 +94,8 @@ typedef struct {
 } WalRecClrBody;
 
 
-/* WAL_REC_FILE_HEADER_UPDATE body — one of two field shapes,
- * discriminated by `field`. root_page_no now lives in RelationDef in
- * __schema.mydb (post code-fix); the file header's root_page_no is
- * vestigial, so FIELD_NUM_PAGES / FIELD_FREE_PAGE_BITMAP are the only
- * two fields this record type ever touches. */
+/* WAL_REC_FILE_HEADER_UPDATE body: a change to a table file header's
+ * page count or free-page bitmap, chosen by field. */
 typedef enum {
     WAL_FHU_FIELD_NUM_PAGES        = 0,
     WAL_FHU_FIELD_FREE_PAGE_BITMAP = 1
@@ -170,15 +117,11 @@ typedef struct {
     } u;
 } WalRecFileHeaderUpdateBody;
 
-/* WAL_REC_CHECKPOINT body — ATT/DPT snapshot. Matches the on-disk
- * encoding exactly so a checkpoint snapshot serializes directly from
- * live ATT/DPT state with no translation step (impl doc §8.7). Only the
- * fixed leading fields (up to and including att_count) are a struct
- * here: dpt_count sits AFTER the variable-length att_entry[] array in
- * the actual byte layout, so the full body — like INSERT/DELETE — is
- * packed by hand, not force-fit into one fixed struct. WalAttEntry /
- * WalDptEntry are the fixed-size entry shapes repeated att_count /
- * dpt_count times. */
+/* WAL_REC_CHECKPOINT body: a snapshot of the active transaction table
+ * and the dirty page table. Only the leading fields are a struct
+ * (WalRecCheckpointHeader); the entries follow, packed by hand:
+ * att_count WalAttEntry, then uint16_t dpt_count, then dpt_count
+ * WalDptEntry. */
 typedef struct {
     uint64_t txn_id;
     uint64_t last_lsn;
@@ -195,10 +138,6 @@ typedef struct {
     uint64_t checkpoint_lsn;
     uint64_t min_rec_lsn;
     uint16_t att_count;
-    /* att_count * WalAttEntry follows immediately here, then:
-     *   uint16_t dpt_count;
-     *   dpt_count * WalDptEntry
-     * — both packed by hand at the call site. */
 } WalRecCheckpointHeader;
 
 #endif /* WAL_TYPES_H */

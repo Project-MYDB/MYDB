@@ -3,10 +3,7 @@
 #include "wal_types.h"
 #include "common.h"
 
-/* wal_page.h's LSN arithmetic assumes this pool's file layout: one header
- * page-slot outside the LSN, then exactly WAL_SEG_SIZE bytes of log. (It
- * was WAL_SEG_SIZE == WAL_SEGMENT_FILE_SIZE while the header page was
- * inside the LSN.) */
+/* wal_page.h's LSN arithmetic assumes this file layout. */
 _Static_assert(WAL_SEGMENT_FILE_SIZE == WAL_PAGE_SIZE + WAL_SEG_SIZE,
                "a segment file must be one header page plus WAL_SEG_SIZE bytes of log");
 
@@ -15,24 +12,19 @@ _Static_assert(WAL_SEGMENT_FILE_SIZE == WAL_PAGE_SIZE + WAL_SEG_SIZE,
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <assert.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
-/* ------------------------------------------------------------------
- * Internal helpers — same shape as disk_manager.c's pwrite_all/
- * pread_all (each on-disk-I/O file in this codebase keeps its own
- * static copy rather than sharing one; ensure_dir mirrors the existing
- * copies already duplicated in engine/src/engine.c and
- * engine/src/stats_buffer.c).
- * ------------------------------------------------------------------ */
-
+/* One pwrite of n bytes; a short write is an error. */
 static int pwrite_all(int fd, const void *buf, size_t n, off_t offset)
 {
     ssize_t written = pwrite(fd, buf, n, offset);
     return (written == (ssize_t)n) ? MYDB_OK : MYDB_ERR;
 }
 
+/* One pread of n bytes; a short read is an error. */
 static int pread_all(int fd, void *buf, size_t n, off_t offset)
 {
     ssize_t got = pread(fd, buf, n, offset);
@@ -50,23 +42,15 @@ static int ensure_dir(const char *path)
     return -1;
 }
 
+/* A log page's file page number, 1..4096 (0 is the header). */
 static int page_no_valid(uint32_t page_no)
 {
     return page_no >= 1 && page_no < WAL_SEGMENT_PAGES_PER_FILE;
 }
 
-/* ------------------------------------------------------------------
- * Per-slot open-or-create.
- *
- * A segment file's page-0 slot is a full WAL_PAGE_SIZE page (not just
- * WAL_SEGMENT_HEADER_ON_DISK_SIZE bytes) — 64 meaningful bytes followed
- * by zero padding to fill the page, same "page N starts at N *
- * WAL_PAGE_SIZE" convention every other on-disk format in this codebase
- * follows (disk_manager.h's FileHeader = page 0, data starts at page 1).
- * Real WAL pages therefore start at page_no = 1. The header page-slot is
- * outside the LSN (wal_page.h), so file page_no p holds log page p - 1 of
- * the segment: the LSN (seg << 22) + (p - 1) * WAL_PAGE_SIZE.
- * ------------------------------------------------------------------ */
+/* Opens slot_no's file and loads its header, or creates it: fallocated
+ * to full size, with a FREE header in page 0, synced. File page p holds
+ * log page p - 1 of the segment. */
 static int open_existing_or_create_slot(WalSegmentPool *pool, uint32_t slot_no)
 {
     char path[300];
@@ -78,7 +62,7 @@ static int open_existing_or_create_slot(WalSegmentPool *pool, uint32_t slot_no)
 
     int fd = open(path, O_RDWR);
     if (fd >= 0) {
-        /* Existing segment file from a prior run — reload its header. */
+        /* A file from an earlier run: load its header. */
         uint8_t page_buf[WAL_PAGE_SIZE];
         if (pread_all(fd, page_buf, WAL_PAGE_SIZE, 0) != MYDB_OK) {
             close(fd);
@@ -94,12 +78,7 @@ static int open_existing_or_create_slot(WalSegmentPool *pool, uint32_t slot_no)
     }
     if (errno != ENOENT) return MYDB_ERR;
 
-    /* Doesn't exist yet — create, pre-allocate, write an initial
-     * SEG_FREE header. posix_fallocate() (portable POSIX call) stands in
-     * for the design doc's "via fallocate()" — Linux fallocate() needs
-     * _GNU_SOURCE, which nothing else in this codebase defines;
-     * posix_fallocate() gives the same practical guarantee (blocks
-     * reserved up front, no later ENOSPC surprise) without it. */
+    /* New file: reserve all its blocks now, so a write never hits ENOSPC. */
     fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
     if (fd < 0) return MYDB_ERR;
 
@@ -111,7 +90,7 @@ static int open_existing_or_create_slot(WalSegmentPool *pool, uint32_t slot_no)
     WalSegmentHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.id.file_type = FILETYPE_WAL_SEGMENT;
-    hdr.segment_no   = 0;   /* placeholder — the real value is stamped at claim time */
+    hdr.segment_no   = 0;   /* set when claimed */
     hdr.partition_id = pool->partition_id;
     hdr.state        = SEG_FREE;
 
@@ -128,16 +107,11 @@ static int open_existing_or_create_slot(WalSegmentPool *pool, uint32_t slot_no)
         return MYDB_ERR;
     }
 
-    /* Read back rather than trust the local hdr — picks up the real
-     * checksum wal_segment_header_serialize stamped into page_buf. */
+    /* Read back, to get the checksum serialize stamped. */
     wal_segment_header_deserialize(page_buf, &slot->header);
     slot->fd = fd;
     return MYDB_OK;
 }
-
-/* ------------------------------------------------------------------
- * Lifecycle
- * ------------------------------------------------------------------ */
 
 int wal_segment_pool_init(WalSegmentPool *pool, const char *wal_dir, uint32_t partition_id)
 {
@@ -151,7 +125,7 @@ int wal_segment_pool_init(WalSegmentPool *pool, const char *wal_dir, uint32_t pa
     for (uint32_t i = 0; i < WAL_SEGMENT_POOL_SLOTS; i++) {
         int rc = open_existing_or_create_slot(pool, i);
         if (rc != MYDB_OK) {
-            /* Close whatever we already opened before bailing out. */
+            /* Close what was opened. */
             for (uint32_t j = 0; j < i; j++) {
                 if (pool->slots[j].fd >= 0) close(pool->slots[j].fd);
             }
@@ -159,19 +133,9 @@ int wal_segment_pool_init(WalSegmentPool *pool, const char *wal_dir, uint32_t pa
         }
     }
 
-    /* A slot reloaded SEG_ACTIVE has a stale on-disk data_pages by
-     * definition (impl doc §8.4). Init used to recount it here by
-     * counting valid pages; the end of the log is now found by
-     * wal_segment_pool_tail_scan, which wal_manager_init calls, so the
-     * cached data_pages of an ACTIVE slot is left as read. */
-
-    /* Reseed the shared claim counter from whatever's on disk — see
-     * wal_segment_pool.h's header comment for why this scheme (one
-     * pool-level counter, assigned at claim time) stands in for the
-     * design doc's Archiver-driven free-time stamping. Counts every slot
-     * that was ever claimed (start_lsn != 0), FREE included, not just the
-     * non-FREE ones: the segment number is part of the LSN, so it must
-     * never drop back (T-010). */
+    /* next_segment_no = one past the highest segment ever claimed
+     * (start_lsn != 0), FREE slots included: segment numbers are part of
+     * the LSN and must never go back. */
     uint64_t max_used = 0;
     int      any_used = 0;
     for (uint32_t i = 0; i < WAL_SEGMENT_POOL_SLOTS; i++) {
@@ -199,10 +163,6 @@ int wal_segment_pool_shutdown(WalSegmentPool *pool)
     return MYDB_OK;
 }
 
-/* ------------------------------------------------------------------
- * Claiming
- * ------------------------------------------------------------------ */
-
 int wal_segment_pool_claim_next(WalSegmentPool *pool, uint32_t *out_slot_index)
 {
     if (!pool || !out_slot_index) return MYDB_ERR;
@@ -212,14 +172,10 @@ int wal_segment_pool_claim_next(WalSegmentPool *pool, uint32_t *out_slot_index)
 
     if (slot->header.state != SEG_FREE) return MYDB_ERR;
 
-    /* Mutate a local copy, not slot->header: if the write below fails we
-     * must leave the in-memory header exactly as it was, or memory and
-     * disk disagree about this slot's state and every later decision
-     * trusts the wrong one. slot->header is only committed once the
-     * write has actually succeeded. */
+    /* A copy: slot->header changes only once the write succeeded. */
     WalSegmentHeader next = slot->header;
     next.segment_no   = pool->next_segment_no;
-    next.start_lsn    = wal_segment_first_lsn(pool->next_segment_no);   /* T-039 */
+    next.start_lsn    = wal_segment_first_lsn(pool->next_segment_no);
     next.end_lsn      = 0;
     next.data_pages   = 0;
     next.state        = SEG_ACTIVE;
@@ -230,8 +186,7 @@ int wal_segment_pool_claim_next(WalSegmentPool *pool, uint32_t *out_slot_index)
     wal_segment_header_serialize(&next, page_buf);
 
     if (pwrite_all(slot->fd, page_buf, WAL_PAGE_SIZE, 0) != MYDB_OK) return MYDB_ERR;
-    /* No fdatasync here — see the header's doc comment for why claim_next
-     * never needs one. */
+    /* No fdatasync: see the header. */
 
     wal_segment_header_deserialize(page_buf, &slot->header);
 
@@ -240,18 +195,15 @@ int wal_segment_pool_claim_next(WalSegmentPool *pool, uint32_t *out_slot_index)
     return MYDB_OK;
 }
 
-int wal_segment_pool_mark_done(WalSegmentPool *pool, WalWorker *worker,
-                               uint32_t slot_index, uint64_t end_lsn, uint32_t data_pages,
-                               uint64_t *out_ticket)
+int wal_segment_pool_mark_done(WalSegmentPool *pool, uint32_t slot_index,
+                               uint64_t end_lsn, uint32_t data_pages)
 {
-    if (out_ticket) *out_ticket = 0;
     if (!pool || slot_index >= WAL_SEGMENT_POOL_SLOTS) return MYDB_ERR;
 
     WalSlot *slot = &pool->slots[slot_index];
     if (slot->header.state != SEG_ACTIVE) return MYDB_ERR;
 
-    /* Local copy, committed to slot->header only after the write and
-     * sync both succeed — see claim_next's own note. */
+    /* A copy: slot->header changes only once the write succeeded. */
     WalSegmentHeader next = slot->header;
     next.end_lsn    = end_lsn;
     next.data_pages = data_pages;
@@ -262,25 +214,10 @@ int wal_segment_pool_mark_done(WalSegmentPool *pool, WalWorker *worker,
     wal_segment_header_serialize(&next, page_buf);
 
     if (pwrite_all(slot->fd, page_buf, WAL_PAGE_SIZE, 0) != MYDB_OK) return MYDB_ERR;
-    if (worker) {
-        /* out_ticket is written by async_fdatasync itself, in the same
-         * call that posts -- so it is set before any later step here can
-         * fail. That ordering is the point: a mark_done that posts and
-         * then returns an error would otherwise leave its caller with no
-         * ticket to drain with, and an undrained mailbox blocks the next
-         * post forever, for the whole partition. */
-        if (wal_worker_async_fdatasync(worker, slot->fd, out_ticket) != MYDB_OK) return MYDB_ERR;
-    } else {
-        if (fdatasync(slot->fd) < 0) return MYDB_ERR;
-    }
 
     wal_segment_header_deserialize(page_buf, &slot->header);
     return MYDB_OK;
 }
-
-/* ------------------------------------------------------------------
- * Raw page I/O
- * ------------------------------------------------------------------ */
 
 int wal_segment_pool_write_page(WalSegmentPool *pool, uint32_t slot_index,
                                  uint32_t page_no, const uint8_t *buf)
@@ -302,143 +239,36 @@ int wal_segment_pool_read_page(WalSegmentPool *pool, uint32_t slot_index,
     return pread_all(pool->slots[slot_index].fd, out_buf, WAL_PAGE_SIZE, offset);
 }
 
-int wal_segment_pool_read_segment(WalSegmentPool *pool, uint32_t slot_index,
-                                   uint8_t *out_buf)
+int wal_segment_pool_pwrite(WalSegmentPool *pool, uint32_t slot_index,
+                            uint64_t lsn, const uint8_t *buf, size_t len)
 {
-    if (!pool || !out_buf || slot_index >= WAL_SEGMENT_POOL_SLOTS) return MYDB_ERR;
-    return pread_all(pool->slots[slot_index].fd, out_buf, WAL_SEGMENT_FILE_SIZE, 0);
+    if (!pool || slot_index >= WAL_SEGMENT_POOL_SLOTS) return MYDB_ERR;
+    if (len == 0) return MYDB_OK;
+    if (!buf) return MYDB_ERR;
+
+    const WalSlot *slot = &pool->slots[slot_index];
+    if (slot->header.state != SEG_ACTIVE) return MYDB_ERR;
+    if (slot->header.segment_no != wal_lsn_segment(lsn)) return MYDB_ERR;
+
+    uint64_t seg_off = lsn & WAL_SEG_MASK;               /* into the segment's log */
+    if (len > WAL_SEG_SIZE - seg_off) return MYDB_ERR;   /* past the segment's end */
+
+    return pwrite_all(slot->fd, buf, len, (off_t)(WAL_PAGE_SIZE + seg_off));
 }
 
-/* ------------------------------------------------------------------
- * wal_segment_pool_write — the Flusher-facing abstraction. A blind byte
- * mover: never parses or constructs WalPageHeader content (the Flusher's
- * buf already carries whatever headers/LSNs it needs, copied straight
- * from ring-buffer frames — impl doc §8.6). Only knows page/segment
- * *geometry*. slot_index/page_no/offset are the caller's own segment-
- * side cursor, purely positional — never derived from anything inside
- * buf (see wal_segment_pool.h for the full contract, including why page
- * numbers never need reconciling between the ring buffer and the
- * segment: WalPageHeader carries no page_no field at all).
- * ------------------------------------------------------------------ */
-
-int wal_segment_pool_write(WalSegmentPool *pool, WalWorker *worker,
-                            uint32_t *slot_index, uint32_t *page_no, uint32_t *offset,
-                            const uint8_t *buf, size_t buf_len)
+uint64_t wal_segment_pool_segment_no(const WalSegmentPool *pool, uint32_t slot_index)
 {
-    if (!pool || !slot_index || !page_no || !offset || !buf) return MYDB_ERR;
-    if (*slot_index >= WAL_SEGMENT_POOL_SLOTS) return MYDB_ERR;
-    if (!page_no_valid(*page_no)) return MYDB_ERR;
-    if (*offset >= WAL_PAGE_SIZE) return MYDB_ERR;
-
-    /* Single exit through `out:` from here on. Once mark_done() below has
-     * handed a flush to worker, EVERY return path has to drain it:
-     * wal_worker_wait() is the only thing that clears the mailbox's done
-     * flag, so returning early without it wedges the next
-     * wal_worker_async_fdatasync() forever — for the whole partition,
-     * not just this call. */
-    int rc = MYDB_OK;
-
-    /* Names the fsync mark_done() handed to worker, if this call rolled
-     * over at all. Stays 0 otherwise, and wal_worker_wait() treats 0 as
-     * "I posted nothing" -- which is what lets the drain at `out:` stay
-     * unconditional without ever collecting the OTHER caller thread's
-     * result. Both WAL paths share one WalWorker (wal_manager.h). */
-    uint64_t flush_ticket = 0;
-
-    size_t written = 0;
-    while (written < buf_len) {
-        uint32_t room_left = WAL_PAGE_SIZE - *offset;
-        size_t   remaining = buf_len - written;
-        uint32_t chunk = (remaining < (size_t)room_left) ? (uint32_t)remaining : room_left;
-
-        off_t abs_offset = (off_t)(*page_no) * WAL_PAGE_SIZE + *offset;
-        if (pwrite_all(pool->slots[*slot_index].fd, buf + written, chunk, abs_offset) != MYDB_OK) {
-            rc = MYDB_ERR;
-            goto out;
-        }
-
-        written += chunk;
-        *offset += chunk;
-
-        if (*offset < WAL_PAGE_SIZE) {
-            /* This page-slot isn't full — every remaining byte must have
-             * fit (chunk was bounded by `remaining`, not `room_left`),
-             * so the loop is about to exit with the cursor left mid-page
-             * for a future call to resume appending into. */
-            break;
-        }
-
-        /* This page-slot just filled exactly. */
-        *offset = 0;
-
-        if (*page_no + 1 >= WAL_SEGMENT_PAGES_PER_FILE) {
-            /* The segment is full too. The one non-"blind" step: read
-             * the page we just filled back and work out where its data
-             * ends — start_lsn + WAL_PAGE_SIZE, since every page the
-             * Flusher writes is full. (It used to copy the page's own
-             * end_lsn field, dropped in T-039, and then add data_len,
-             * dropped after it; see wal_page.h.) A field read, not
-             * content interpretation. */
-            uint8_t  last_page[WAL_PAGE_SIZE];
-            uint64_t seg_end_lsn = 0;
-            if (wal_segment_pool_read_page(pool, *slot_index, *page_no, last_page) == MYDB_OK) {
-                WalPageHeader hdr;
-                if (wal_page_header_deserialize(last_page, &hdr) == MYDB_OK)
-                    seg_end_lsn = hdr.start_lsn + WAL_PAGE_SIZE;
-            }
-
-            uint32_t finished_slot       = *slot_index;
-            uint32_t finished_data_pages = *page_no;
-            if (wal_segment_pool_mark_done(pool, worker, finished_slot, seg_end_lsn,
-                                           finished_data_pages, &flush_ticket) != MYDB_OK) {
-                rc = MYDB_ERR;
-                goto out;
-            }
-            /* mark_done may have just handed a flush to worker — from
-             * here on, bailing out without draining it would wedge the
-             * mailbox, hence goto rather than return. */
-            if (wal_segment_pool_claim_next(pool, slot_index) != MYDB_OK) {
-                rc = MYDB_ERR;
-                goto out;
-            }
-            *page_no = 1;
-        } else {
-            (*page_no)++;
-        }
-    }
-
-    /* TEMPORARY: fdatasync every call, since there's no Flusher/group-commit
-     * yet to batch many writes behind one flush (design doc §11).
-     * fdatasync() flushes every dirty page of this fd, not just what this
-     * call wrote, so this is correct even after a mid-call segment
-     * rollover (the finalized old segment was already fdatasync'd by
-     * mark_done() itself; this covers whatever landed in the current
-     * *slot_index since). Segment files are posix_fallocate'd to their
-     * full fixed size once at creation and never resized again, so
-     * fdatasync (which skips flushing metadata not needed for correct
-     * data retrieval, e.g. timestamps) is strictly cheaper than fsync
-     * here with no durability difference for our data — avoids dragging
-     * the filesystem journal into every WAL flush on filesystems like
-     * ext4. Remove this one line once the Flusher lands and does its own
-     * batched flush at the end of each flush cycle instead. */
-    if (fdatasync(pool->slots[*slot_index].fd) < 0) rc = MYDB_ERR;
-
-out:
-    /* If this call rolled over, mark_done() may have handed its fsync to
-     * worker instead of waiting for it (see mark_done's own doc comment)
-     * — confirm it's actually durable before telling our own caller this
-     * call succeeded. Cheap no-op if it didn't. Runs unconditionally,
-     * including on the error paths above: draining is what keeps the
-     * shared mailbox usable, and the worker's own result still counts
-     * toward what we report. */
-    if (worker && wal_worker_wait(worker, flush_ticket) != MYDB_OK) rc = MYDB_ERR;
-
-    return rc;
+    assert(pool && slot_index < WAL_SEGMENT_POOL_SLOTS);
+    return pool->slots[slot_index].header.segment_no;
 }
 
-/* ------------------------------------------------------------------
- * Finding the end of the log (see wal_segment_pool.h)
- * ------------------------------------------------------------------ */
+int wal_segment_pool_fdatasync_segment(WalSegmentPool *pool, uint64_t seg)
+{
+    if (!pool) return MYDB_ERR;
+    int fd = pool->slots[seg % WAL_SEGMENT_POOL_SLOTS].fd;
+    return fdatasync(fd) == 0 ? MYDB_OK : MYDB_ERR;
+}
+
 
 /* The slot holding segment seg (any state but FREE), or -1. */
 static int slot_of_segment(const WalSegmentPool *pool, uint64_t seg)
@@ -449,34 +279,27 @@ static int slot_of_segment(const WalSegmentPool *pool, uint64_t seg)
     return -1;
 }
 
-/* Reads the log page holding lsn, from whichever slot holds its segment,
- * and checks it is the page that belongs at that position: a valid header
- * (magic, checksum) whose start_lsn is the page's own LSN. An unwritten
- * page fails the magic check, and a stale page from an earlier pass
- * through the slot carries another segment's start_lsn (PostgreSQL's
- * xlp_pageaddr check). Returns MYDB_OK, MYDB_ERR_NOT_FOUND when the page
- * is not there (the log ends before it), or MYDB_ERR when the read itself
- * fails: an I/O error must not pass for the end of the log. */
+/* Reads the log page holding lsn and checks it belongs there: a valid
+ * header whose start_lsn is the page's own LSN (an unwritten page fails
+ * the magic check, a stale one has another start_lsn). Returns MYDB_OK,
+ * MYDB_ERR_NOT_FOUND if the page is not there, or MYDB_ERR if the read
+ * fails. */
 static int read_log_page(WalSegmentPool *pool, uint64_t lsn, uint8_t *page, WalPageHeader *ph)
 {
     int slot = slot_of_segment(pool, wal_lsn_segment(lsn));
     if (slot < 0) return MYDB_ERR_NOT_FOUND;
-    /* File page 0 is the segment header, outside the LSN. */
     if (wal_segment_pool_read_page(pool, (uint32_t)slot, wal_lsn_page(lsn) + 1, page) != MYDB_OK) return MYDB_ERR;
     if (wal_page_header_deserialize(page, ph) != MYDB_OK) return MYDB_ERR_NOT_FOUND;
     if (ph->start_lsn != (lsn & ~(uint64_t)(WAL_PAGE_SIZE - 1))) return MYDB_ERR_NOT_FOUND;
     return MYDB_OK;
 }
 
-/* Reads the record that should start at data position lsn into *buf
- * (grown as needed) and checks it, the way PostgreSQL's reader does: its
- * lsn field is its own position (catches stale bytes in a page that is
- * otherwise current), total_len is at least a header and fits before
- * log_end, every page it continues onto is valid and carries the
- * INCOMING flag, and its CRC holds. A record may cross into the next
- * segment. Returns MYDB_OK with *out_total, MYDB_ERR_NOT_FOUND when there
- * is no valid record there (the end of the log), or MYDB_ERR when a read
- * or an allocation fails. */
+/* Reads the record at lsn into *buf (grown as needed) and checks it, as
+ * PostgreSQL's reader does: its lsn field is its position, total_len is
+ * at least a header and fits before log_end, every page it continues
+ * onto is valid and flagged INCOMING, and its CRC holds. Returns MYDB_OK
+ * with *out_total, MYDB_ERR_NOT_FOUND if no valid record is there, or
+ * MYDB_ERR if a read or an allocation fails. */
 static int read_record(WalSegmentPool *pool, uint64_t log_end, uint64_t lsn,
                        uint8_t **buf, size_t *cap, uint32_t *out_total)
 {
@@ -488,9 +311,8 @@ static int read_record(WalSegmentPool *pool, uint64_t log_end, uint64_t lsn,
     size_t        need  = WAL_RECORD_HEADER_SIZE;
     uint32_t      total = 0;
 
-    /* Record bytes left from lsn to log_end: the most a record starting
-     * here can hold, so a garbage total_len never makes us allocate more
-     * than the log that is there. */
+    /* Record bytes from lsn to log_end: a bad total_len above it is
+     * rejected before anything is allocated. */
     uint64_t avail = (log_end >> WAL_PAGE_SHIFT) * WAL_PAGE_USABLE - wal_lsn_to_byte(lsn);
 
     while (got < need) {
@@ -554,22 +376,17 @@ int wal_segment_pool_tail_scan(WalSegmentPool *pool, uint32_t *out_slot,
     if (!found) return MYDB_ERR_NOT_FOUND;   /* brand-new log */
 
     uint64_t active  = pool->slots[best].header.segment_no;
-    uint64_t log_end = (active + 1) << WAL_SEG_SHIFT;   /* nothing exists past the active segment */
+    uint64_t log_end = (active + 1) << WAL_SEG_SHIFT;
 
-    /* Where the walk starts: the previous segment, when a slot still holds
-     * it, since the end of the log can lie there (a record whose tail in
-     * the active segment was never written, or a torn tail in the previous
-     * segment whose pages reached disk after the active segment's). The
-     * checkpoint will give this start point once it exists (V2 §13). */
+    /* Start one segment early when it is still there: the end can lie in
+     * it (see the header). */
     uint64_t start_seg = (active > 0 && slot_of_segment(pool, active - 1) >= 0) ? active - 1 : active;
 
     uint8_t       page[WAL_PAGE_SIZE];
     WalPageHeader ph;
 
-    /* The first record of the start segment: past any bytes at its start
-     * that continue a record from the segment before it (whole pages of
-     * it, then continuation_len bytes of a partly continued page). If a
-     * page is not there, nothing past it was written. */
+    /* Skip to the start segment's first record, past bytes continuing a
+     * record from the segment before. */
     uint64_t pos = start_seg << WAL_SEG_SHIFT;
     for (;;) {
         if (pos >= log_end) break;
@@ -584,10 +401,8 @@ int wal_segment_pool_tail_scan(WalSegmentPool *pool, uint32_t *out_slot,
         pos += WAL_PAGE_SIZE;   /* the whole page continues that record */
     }
 
-    /* Walk records, across segments, until the first one that does not
-     * check out. pos is just past the last valid record (a page end when
-     * it filled its page exactly); a record that starts at a page end
-     * starts past the next page's header. */
+    /* Walk records until the first that does not check out; pos ends
+     * just past the last valid one. */
     if (wal_lsn_offset(pos) != 0) {
         uint8_t *buf = NULL;
         size_t   cap = 0;
@@ -601,24 +416,17 @@ int wal_segment_pool_tail_scan(WalSegmentPool *pool, uint32_t *out_slot,
             pos = wal_lsn_advance(rec, total);
         }
         free(buf);
-        if (rc != MYDB_OK && rc != MYDB_ERR_NOT_FOUND) return MYDB_ERR;   /* a read or allocation failed */
+        if (rc != MYDB_OK && rc != MYDB_ERR_NOT_FOUND) return MYDB_ERR;
     }
 
-    /* The slot of the segment the end is in. An end exactly at the active
-     * segment's end has no segment after it yet, so it stays with the
-     * active one. */
+    /* An end exactly at the active segment's end stays with that slot. */
     int end_slot = slot_of_segment(pool, wal_lsn_segment(pos));
     *out_slot    = (end_slot >= 0) ? (uint32_t)end_slot : best;
     *out_end_lsn = pos;
     return MYDB_OK;
 }
 
-/* ------------------------------------------------------------------
- * Cutting the log at its end (see wal_segment_pool.h)
- * ------------------------------------------------------------------ */
-
-/* Writes hdr as slot's page-0 header and, once written, makes it the
- * cached copy (same order as claim_next: memory follows disk). */
+/* Writes hdr as slot's header, then caches it. */
 static int write_header(WalSegmentPool *pool, uint32_t slot, const WalSegmentHeader *hdr)
 {
     uint8_t page_buf[WAL_PAGE_SIZE];
@@ -629,9 +437,7 @@ static int write_header(WalSegmentPool *pool, uint32_t slot, const WalSegmentHea
     return MYDB_OK;
 }
 
-/* Zeroes slot's log from segment offset `from` (bytes into its 4MB of
- * log) to the segment's end: the rest of the page `from` falls in, then
- * every later page. */
+/* Zeroes slot's log from byte `from` of the segment to its end. */
 static int zero_log_from(WalSegmentPool *pool, uint32_t slot, uint64_t from)
 {
     uint8_t page[WAL_PAGE_SIZE];
@@ -656,10 +462,7 @@ int wal_segment_pool_truncate(WalSegmentPool *pool, uint32_t slot_index, uint64_
     if (slot->header.state == SEG_FREE) return MYDB_ERR;
     uint64_t seg = slot->header.segment_no;
 
-    /* 1. Discard every segment after the end's: its pages are zeroed and
-     *    its header goes back to FREE with segment_no and start_lsn
-     *    cleared, so its number is reused (the log continues from
-     *    end_lsn) and init's reseed does not count it. */
+    /* 1. Discard every later segment: zeroed, FREE, number cleared. */
     for (uint32_t i = 0; i < WAL_SEGMENT_POOL_SLOTS; i++) {
         WalSegmentHeader h = pool->slots[i].header;
         if (h.state == SEG_FREE || h.segment_no <= seg) continue;
@@ -668,26 +471,24 @@ int wal_segment_pool_truncate(WalSegmentPool *pool, uint32_t slot_index, uint64_
         if (write_header(pool, i, &h) != MYDB_OK) return MYDB_ERR;
     }
 
-    /* 2. The end's segment is where the log goes on: ACTIVE again if it
-     *    had been finished. */
+    /* 2. The end's segment is ACTIVE again. */
     if (slot->header.state != SEG_ACTIVE) {
         WalSegmentHeader h = slot->header;
         h.state = SEG_ACTIVE; h.end_lsn = 0; h.data_pages = 0;
         if (write_header(pool, slot_index, &h) != MYDB_OK) return MYDB_ERR;
     }
 
-    /* 3. Nothing after end_lsn may look like log. An end exactly at the
-     *    segment's end leaves nothing to zero. */
+    /* 3. Zero everything after end_lsn. */
     if (wal_lsn_segment(end_lsn) == seg &&
         zero_log_from(pool, slot_index, end_lsn & WAL_SEG_MASK) != MYDB_OK)
         return MYDB_ERR;
 
-    /* 4. What the scan read, and what was just zeroed, is on disk. */
+    /* 4. Sync it all. */
     for (uint32_t i = 0; i < WAL_SEGMENT_POOL_SLOTS; i++)
         if (pool->slots[i].header.state != SEG_FREE && fdatasync(pool->slots[i].fd) < 0)
             return MYDB_ERR;
 
-    /* 5. The next segment to claim is the one after the end's. */
+    /* 5. The next claim is the segment after the end's. */
     pool->next_segment_no = seg + 1;
     return MYDB_OK;
 }

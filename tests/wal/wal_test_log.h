@@ -17,14 +17,14 @@
 #include "wal_segment_pool.h"
 
 /* ------------------------------------------------------------------
- * A hand-built segment for the tail_scan tests: a 4 MB image of one
+ * A hand-built segment for the tail_scan tests: a 16 MB image of one
  * segment's log, laid out the way the insert path writes it (a 24 B page
  * header at every page: start_lsn, continuation_len, INCOMING flag;
  * records back to back), then written page by page into its slot.
  * ------------------------------------------------------------------ */
 typedef struct {
     uint8_t  *img;        /* TL_SEGS segments of log, from seg_start */
-    uint64_t  seg_start;  /* first segment << 22                     */
+    uint64_t  seg_start;  /* first segment << WAL_SEG_SHIFT          */
     uint64_t  pos;        /* just past the last byte laid out        */
 } TestLog;
 

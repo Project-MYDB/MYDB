@@ -19,56 +19,45 @@ foreach(mod ${STORAGE_ONLY_TEST_MODULES})
     add_test(NAME test_${mod} COMMAND test_${mod})
 endforeach()
 
-# WAL — the on-disk struct layer (record/page/segment header
-# format + checksum). Skeleton only this phase: no file I/O, no ring
-# buffer, no threads (see MYDB_WAL_IMPLEMENTATION.md §8).
+# WAL: record, page and segment header formats and checksums.
 add_executable(test_wal_types wal/test_wal_types.c)
 target_link_libraries(test_wal_types PRIVATE wal)
 add_test(NAME test_wal_types COMMAND test_wal_types)
 
-# The large_wal tests (Phases 1-5, the registry, the manager and the
-# concurrency test) and the old test_wal_manager moved out with their code to
-# ../large_wal_stash (tests_CMakeLists_fragment.txt holds their blocks).
-
-# WAL Phase 2 — the pool of 10 physical wal_<N>.mydb segment files:
-# pre-allocation, round-robin claiming, raw page I/O, crash-reload
-# tail-scan (MYDB_WAL_IMPLEMENTATION.md §8.4). Real file I/O under /tmp.
+# wal_segment_pool: the segment files, claiming, I/O, finding and cutting
+# the end of the log. Real files under /tmp.
 add_executable(test_wal_segment_pool wal/test_wal_segment_pool.c)
 target_link_libraries(test_wal_segment_pool PRIVATE wal)
 add_test(NAME test_wal_segment_pool COMMAND test_wal_segment_pool)
 
-# WAL Phases 3 and 4 had test_wal_ring_buffer (the V1 16MB ring buffer)
-# and test_wal_flusher (the V1 Flusher thread, the first genuinely
-# concurrent test in this codebase). Both went with that code when V2
-# retired it; test_wal_insert / test_wal_flush replace them.
-
-# wal_mailbox — the shared background-thread + request/response queue
-# that wal_worker and LargeWalWriter's submit() (large_wal, now moved out)
-# were both hand-written copies of. Tests the four rules its header now owns: the depth slot
-# comes back on collect (not on handler completion), a queued request is
-# still served during shutdown, waiting on an unposted node is a no-op,
-# and two callers in flight each collect their own result.
-add_executable(test_wal_mailbox wal/test_wal_mailbox.c)
-target_link_libraries(test_wal_mailbox PRIVATE wal)
-add_test(NAME test_wal_mailbox COMMAND test_wal_mailbox)
-
-# wal_worker — the shared persistent background thread that overlaps a
-# segment rollover's two distinct-file fsyncs (old segment's mark_done,
-# new segment's trailing write) instead of paying for them sequentially.
+# wal_worker: the background fdatasync of finished segments and its
+# publishing of flushed_lsn.
 add_executable(test_wal_worker wal/test_wal_worker.c)
 target_link_libraries(test_wal_worker PRIVATE wal)
 add_test(NAME test_wal_worker COMMAND test_wal_worker)
 
-# wal_insert — the V2 insert path (MYDB_WAL_DESIGN_V2.md §9, §10): block
-# counters, copy and publish, wal_insert, space check, concurrent inserts.
+# wal_insert: block counters, planning and copying pieces, wal_insert,
+# the space check where it passes, and the completeness scan.
 add_executable(test_wal_insert wal/test_wal_insert.c)
 target_link_libraries(test_wal_insert PRIVATE wal)
 add_test(NAME test_wal_insert COMMAND test_wal_insert)
 
-# wal_manager (lifecycle/ownership; was normal_wal_manager, which mirrored
-# LargeWalManager, merged with the old top-level wal_manager): owns
-# WalWorker + WalSegmentPool (it also owned the V1 WalRingBuffer and
-# WalFlusher until V2 retired them), one init() call brings them up.
+# wal_flush: the write step on real files, the hole wait, the space
+# waiter, log_flush, and concurrent sessions. TIMEOUT: a lost
+# wake-up or a stuck hole would hang.
+add_executable(test_wal_flush wal/test_wal_flush.c)
+target_link_libraries(test_wal_flush PRIVATE wal)
+add_test(NAME test_wal_flush COMMAND test_wal_flush)
+set_tests_properties(test_wal_flush PROPERTIES TIMEOUT 180)
+
+# wal_group_commit_lock (after MariaDB's group_commit_lock). TIMEOUT: a
+# lost wake-up would hang.
+add_executable(test_wal_group_commit_lock wal/test_wal_group_commit_lock.c)
+target_link_libraries(test_wal_group_commit_lock PRIVATE wal)
+add_test(NAME test_wal_group_commit_lock COMMAND test_wal_group_commit_lock)
+set_tests_properties(test_wal_group_commit_lock PROPERTIES TIMEOUT 60)
+
+# wal_manager: init, shutdown, and resuming at the end of the log.
 add_executable(test_wal_manager wal/test_wal_manager.c)
 target_link_libraries(test_wal_manager PRIVATE wal)
 add_test(NAME test_wal_manager COMMAND test_wal_manager)

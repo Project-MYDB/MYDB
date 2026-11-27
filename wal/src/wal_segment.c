@@ -3,23 +3,11 @@
 
 #include <string.h>
 
-/*
- * Field-by-field memcpy throughout, not a whole-struct memcpy through a
- * cast buf pointer — same reasoning file_header.c already documents:
- * avoids alignment assumptions about caller-provided buffers.
- *
- * Caller sets every field of *hdr except checksum before calling
- * wal_segment_header_serialize(); id.magic/id.version are overwritten
- * internally via file_header_write_id() regardless of what the caller
- * put there (only id.file_type is actually read from *hdr) — the same
- * contract every other on-disk struct in this codebase follows.
- */
+/* Fields are copied one by one at fixed offsets, so buf needs no
+ * alignment. serialize writes magic and version itself; of hdr->id it
+ * reads only file_type. */
 
-/* WalSegmentHeader — documented on-disk shape is 48 bytes, serialized
- * into a 64-byte on-disk buffer (16 trailing bytes zeroed, reserved for
- * future extension). Checksum covers the 44 bytes preceding it (id[8] +
- * segment_no[8] + start_lsn[8] + end_lsn[8] + partition_id[4] +
- * data_pages[4] + state[1] + reserved[3]). */
+/* The checksum covers the 44 bytes before it. */
 #define WAL_SEGMENT_HEADER_CHECKSUM_OFFSET 44
 
 void wal_segment_header_serialize(const WalSegmentHeader *hdr, uint8_t *buf)

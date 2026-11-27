@@ -32,16 +32,12 @@ static void test_size_constants(void)
     printf("\n[test_size_constants]\n");
     CHECK(WAL_PAGE_USABLE == WAL_PAGE_SIZE - WAL_PAGE_HEADER_SIZE,
           "WAL_PAGE_USABLE == WAL_PAGE_SIZE - WAL_PAGE_HEADER_SIZE");
-    /* (WAL_MAX_ROW_BODY == WAL_MAX_RECORD_SIZE - WAL_RECORD_HEADER_SIZE was
-     * checked here; both constants went with T-039 — records span pages.) */
-    /* V2 §4 rule 6: the segment's header page is outside the LSN, so the
-     * first record is just past page 0's own 24-byte page header. (It was
-     * 4096 + 24 = 4120, and 511 log pages per segment, while the header
-     * page counted.) */
+    /* The segment's header page is outside the LSN, so the first record
+     * is just past the first log page's 24-byte header. */
     CHECK(WAL_FIRST_RECORD_LSN == WAL_PAGE_HEADER_SIZE,
           "WAL_FIRST_RECORD_LSN == 24, page 0's header only");
-    CHECK(WAL_SEG_SIZE == (1u << 22) && WAL_SEG_PAGES == 1024,
-          "a segment holds exactly 4MB of log, 1024 pages");
+    CHECK(WAL_SEG_SIZE == (1u << 24) && WAL_SEG_PAGES == 4096,
+          "a segment holds exactly 16MB of log, 4096 pages");
 }
 
 /* V2 §4 rule 6 and the Appendix E number checks: pos (record bytes only)
@@ -54,22 +50,22 @@ static void test_lsn_rule_6(void)
     CHECK(wal_byte_to_lsn(4071) == 4095,            "pos 4071 -> LSN 4095 (last byte of page 0)");
     CHECK(wal_byte_to_lsn(4072) == 4096 + 24,       "pos 4072 -> LSN 4120 (past page 1's header)");
     CHECK(wal_lsn_to_byte(4120) == 4072,            "and back: LSN 4120 -> pos 4072");
-    CHECK((uint64_t)WAL_SEG_PAGES * WAL_PAGE_USABLE == 4169728u,
-          "1024 x 4072 = 4,169,728 record bytes per segment");
+    CHECK((uint64_t)WAL_SEG_PAGES * WAL_PAGE_USABLE == 16678912u,
+          "4096 x 4072 = 16,678,912 record bytes per segment");
 
     /* Crossing a segment boundary skips nothing: the last byte of
-     * segment 0 is pos 4,169,727, and the next one is segment 1's first
-     * record, at (1 << 22) + 24. */
-    CHECK(wal_byte_to_lsn(4169727) == (1u << 22) - 1,  "last record byte of segment 0 is LSN 4MB - 1");
-    CHECK(wal_byte_to_lsn(4169728) == (1u << 22) + 24, "the next is segment 1's first record");
-    CHECK(wal_segment_first_lsn(1) == (1u << 22) + 24, "wal_segment_first_lsn(1) agrees");
-    CHECK(wal_lsn_segment((1u << 22) + 24) == 1 && wal_lsn_page((1u << 22) + 24) == 0,
+     * segment 0 is pos 16,678,911, and the next one is segment 1's first
+     * record, at (1 << 24) + 24. */
+    CHECK(wal_byte_to_lsn(16678911) == (1u << 24) - 1, "last record byte of segment 0 is LSN 16MB - 1");
+    CHECK(wal_byte_to_lsn(16678912) == (1u << 24) + 24, "the next is segment 1's first record");
+    CHECK(wal_segment_first_lsn(1) == (1u << 24) + 24, "wal_segment_first_lsn(1) agrees");
+    CHECK(wal_lsn_segment((1u << 24) + 24) == 1 && wal_lsn_page((1u << 24) + 24) == 0,
           "it is segment 1, page 0");
 
     CHECK(wal_lsn_advance(24, 4072) == 4096,          "4072 record bytes from LSN 24 end exactly at page 0's end");
     CHECK(wal_lsn_advance(24, 4073) == 4096 + 24 + 1, "one more goes past page 1's header");
 
-    uint64_t lsn = (5ull << 22) + (235ull << 12) + 1501;   /* segment 5, page 235, offset 1501 */
+    uint64_t lsn = (5ull << 24) + (235ull << 12) + 1501;   /* segment 5, page 235, offset 1501 */
     CHECK(wal_lsn_segment(lsn) == 5 && wal_lsn_page(lsn) == 235 && wal_lsn_offset(lsn) == 1501,
           "segment, page and offset come straight out of the bits");
     CHECK(wal_byte_to_lsn(wal_lsn_to_byte(lsn)) == lsn, "lsn_to_byte and byte_to_lsn are inverses");
@@ -102,8 +98,7 @@ static void test_page_header_round_trip(void)
     CHECK(out.reserved[0] == 0x5C,           "reserved[1] round-trips");
 
     /* The on-disk layout, byte by byte: id 0-7, start_lsn 8-15,
-     * continuation_len 16-17, flags 18, reserved 19, CRC 20-23. (It was
-     * 32 bytes with data_len at 16-17 until data_len was dropped.) */
+     * continuation_len 16-17, flags 18, reserved 19, CRC 20-23. */
     uint16_t cl;
     uint64_t sl;
     uint32_t cs;
@@ -200,17 +195,12 @@ static void test_segment_header_detects_tamper(void)
     CHECK(rc == MYDB_ERR_BAD_CHECKSUM, "corrupted segment header fails checksum verification");
 }
 
-/* A record body far past WAL_MAX_ROW_BODY must round-trip. This used to
- * be impossible: serialize/deserialize copied header+body into a stack
- * scratch sized `40 + WAL_MAX_ROW_BODY` (4020; the constant is gone
- * now), so any LARGE_WAL-sized body
- * (or a record spanning pages) overran it. Both now fold the two spans in with crc32c_update instead,
- * with no scratch and no size ceiling. */
+/* A 400 KB body round-trips: the checksum has no size limit. */
 static void test_record_header_large_body(void)
 {
     printf("\n[test_record_header_large_body]\n");
 
-    size_t body_len = 400 * 1024;          /* ~100x the old 4020-byte WAL_MAX_ROW_BODY */
+    size_t body_len = 400 * 1024;
     uint8_t *body = malloc(body_len);
     for (size_t i = 0; i < body_len; i++) body[i] = (uint8_t)(i & 0xFF);
 
@@ -233,11 +223,8 @@ static void test_record_header_large_body(void)
     free(body);
 }
 
-/* The on-disk header is the struct's first 44 bytes, every field at an
- * offset that is a multiple of its size (txn_id at 16, total_len at 24;
- * they used to be the other way round, at 20 and 16). Checked on the
- * packed bytes themselves, not only by a round trip, which would pass
- * with any layout as long as pack and deserialize agree. */
+/* The on-disk header is the struct's first 44 bytes. Checked on the
+ * packed bytes, since a round trip passes with any layout. */
 static void test_record_header_layout(void)
 {
     printf("\n[test_record_header_layout]\n");

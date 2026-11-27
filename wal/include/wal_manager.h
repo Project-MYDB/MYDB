@@ -1,38 +1,29 @@
 #ifndef WAL_MANAGER_H
 #define WAL_MANAGER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "common.h"
 #include "wal_segment_pool.h"
 #include "wal_worker.h"
 #include "wal_frame_state.h"
+#include "wal_group_commit_lock.h"
 
 /*
- * wal_manager.h — owns every WAL sub-piece for one partition. It is the
- * WAL's single front door, Lifecycle and ownership
- * here; the insert path will live in wal_insert.{h,c} and the write and
- * flush path in wal_flush.{h,c}, both working on a WalManager *.
-
- *
- * Start-up finds the end of the log (wal_segment_pool_tail_scan) before
- * anything else; only a brand-new log gets a fresh segment. ARIES
- * redo/undo on top of that is the recovery piece's job.
+ * wal_manager.h — one partition's WAL: the ring and its block counters,
+ * the log positions, the group commit locks, the segment pool and the
+ * worker. The insert path (wal_insert) and the write and flush path
+ * (wal_flush) work on it. Start-up resumes at the end of the log found
+ * on disk; replaying it (ARIES redo/undo) is recovery's job.
  */
 
-/* Ring frames, a power of two (the ring frame of an LSN is a mask).
- * 1024 frames = a 4MB ring. V2 leaves the default OPEN (§16, T-068). */
-#define WAL_RING_FRAMES 1024u
+/* Frames in the ring, a power of two: 2048 frames = an 8MB ring. */
+#define WAL_RING_FRAMES 2048u
 _Static_assert((WAL_RING_FRAMES & (WAL_RING_FRAMES - 1)) == 0, "WAL_RING_FRAMES must be a power of two");
 
-/* Layout as V2 §5: fields nobody writes after init share the first cache
- * line (no false sharing from fields that never change), and each hot
- * atomic gets its own line: current_pos is hit by every insert,
- * write_lsn by every space check that has to reload it.
- *
- * Because of the _Alignas(64) members the struct's alignment is 64. On
- * the stack or as a global that is automatic; a heap-allocated
- * WalManager (e.g. inside PartitionCtx later) must come from
- * aligned_alloc(64, ...), since malloc only promises 16. */
+/* The WAL of one partition (V2 §5). Fields fixed after init share the
+ * first cache line; each hot atomic and each lock has its own. Its
+ * alignment is 64, so a heap-allocated one needs aligned_alloc(64, ...). */
 typedef struct {
     /* set at init, read-only after */
     uint8_t         *ring_buf;        /* WAL_RING_FRAMES * 4KB, aligned 4096   */
@@ -43,40 +34,36 @@ typedef struct {
     uint32_t         partition_id;
 
     /* hot atomics, one cache line each */
-    _Alignas(64) _Atomic uint64_t current_pos;  /* next reservation, in record bytes (V2 §4) */
-    _Alignas(64) _Atomic uint64_t write_lsn;    /* pwritten to the segment up to here       */
+    _Alignas(64) _Atomic uint64_t current_pos;  /* next reservation, in record bytes */
+    _Alignas(64) _Atomic uint64_t write_lsn;    /* written to the files up to here   */
+    _Alignas(64) _Atomic uint64_t flushed_lsn;  /* synced up to here                 */
 
-    /* owned by whoever runs the write step (wal_flush); the pool and
-     * worker were here before V2 */
-    _Alignas(64) uint32_t curr_slot;    /* the active segment slot (V2 §5)      */
-    uint32_t              last_ctr_idx; /* the block the next write-step scan
-                                           starts at (V2 §10.2, §10.7)        */
+    /* their values are write_lsn and flushed_lsn */
+    _Alignas(64) WalGroupCommitLock write_lock;   /* guards the write step */
+    _Alignas(64) WalGroupCommitLock flush_lock;   /* guards the fdatasync  */
+
+    /* touched only by the holder of write_lock (and init) */
+    _Alignas(64) uint32_t curr_slot;    /* the slot being written               */
+    uint32_t              last_ctr_idx; /* the block the next scan starts at   */
     WalSegmentPool        pool;
+    bool                  locks_up;     /* write_lock and flush_lock exist */
     WalWorker             worker;
 } WalManager;
 
 
 
-/* wal_worker_start -> wal_segment_pool_init -> find the end of the log
- * and resume there, unwinding whatever already succeeded on any failure:
- *   - an existing log: wal_segment_pool_tail_scan finds the end and its
- *     segment's slot (curr_slot), wal_segment_pool_truncate cuts the log
- *     there (later segments discarded, everything after the end zeroed,
- *     synced);
- *   - a brand-new log (no ACTIVE segment): claim a fresh segment, whose
- *     start is the end.
- * Then allocates the ring (WAL_RING_FRAMES frames, 4096-aligned) and its
- * block counters (64-aligned), both zeroed, and resumes at the end (V2
- * §10.7): current_pos = record bytes before it, write_lsn = the end, the
- * end's partial page copied into its ring frame, the counter of the
- * end's block seeded with the bytes already in it, last_ctr_idx = that
- * block. An end at a page's offset 24 resumes at the page's start (the
- * next copier writes that header). Same path after a clean shutdown or a
- * crash. ARIES redo/undo is the recovery piece, on top of this. */
+/* Opens the pool and resumes at the end of the log: an existing log is
+ * scanned (wal_segment_pool_tail_scan) and cut there
+ * (wal_segment_pool_truncate); a new log claims its first segment. Then
+ * allocates the ring and counters, copies the end's partial page into its
+ * frame and seeds its block's counter, sets current_pos, write_lsn,
+ * flushed_lsn and last_ctr_idx to the end, and starts the worker. Undoes
+ * everything on failure. */
 int wal_manager_init(WalManager *wm, const char *wal_dir, uint32_t partition_id);
 
-/* Reverses init(): frees the ring and counters, segment_pool_shutdown,
- * worker_stop. Safe on a partially-initialised wm. */
+/* Undoes init, the worker first (it syncs what was requested). Safe on a
+ * partly initialised wm; no other thread may use it. Returns MYDB_ERR if
+ * the worker had hit a failed fdatasync. */
 int wal_manager_shutdown(WalManager *wm);
 
 #endif /* WAL_MANAGER_H */

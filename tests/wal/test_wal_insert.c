@@ -1,6 +1,5 @@
 #include <dirent.h>
 #include <pthread.h>
-#include <sched.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -12,6 +11,7 @@
 
 #include "checksum.h"
 #include "common.h"
+#include "wal_flush.h"
 #include "wal_frame_state.h"
 #include "wal_insert.h"
 #include "wal_page.h"
@@ -20,8 +20,10 @@
 /*
  * test_wal_insert — the V2 insert path (MYDB_WAL_DESIGN_V2.md §9, §10):
  * block counters, reserving, filling record headers, planning a piece
- * and copying it, wal_insert, the space check, and sessions inserting
- * concurrently against a stand-in write step.
+ * and copying it, wal_insert, and the space check where it passes. Also
+ * the write step's completeness scan (wal_flush_scan, §10.5), which reads
+ * these counters. The space check that has to wait runs the write step,
+ * so it is tested in test_wal_flush, on segment files.
  */
 
 static int tests_run    = 0;
@@ -73,7 +75,7 @@ static void test_block_counter_indexing(void)
     CHECK((uintptr_t)&c[4] - (uintptr_t)&c[0] == 64, "counter 4 is 64 bytes after counter 0");
 }
 
-/* A WalManager with only what the insert path touches: a zeroed 4 MB
+/* A WalManager with only what the insert path touches: a zeroed 8 MB
  * ring and its counters, in memory (no segment files). */
 static void ring_setup(WalManager *wm)
 {
@@ -85,10 +87,14 @@ static void ring_setup(WalManager *wm)
     wm->fs_counters = aligned_alloc(64, (size_t)WAL_RING_FRAMES * WAL_FRAME_BLOCKS * sizeof(WalBlockCounter));
     memset(wm->ring_buf, 0, (size_t)WAL_RING_FRAMES * 4096);
     memset(wm->fs_counters, 0, (size_t)WAL_RING_FRAMES * WAL_FRAME_BLOCKS * sizeof(WalBlockCounter));
+    /* The space check takes write_lock when it has to wait; these tests
+     * never let it (no segment files to write to). */
+    wal_gcl_init(&wm->write_lock, &wm->write_lsn);
 }
 
 static void ring_free(WalManager *wm)
 {
+    wal_gcl_destroy(&wm->write_lock);
     free(wm->ring_buf);
     free(wm->fs_counters);
 }
@@ -304,15 +310,15 @@ static void test_plan_wraps(void)
     ring_setup(&wm);
     uint8_t buf[100];
     make_batch(buf, (uint32_t[]){100}, 1);
-    uint64_t lap = (uint64_t)WAL_RING_FRAMES * 4096;   /* 4 MB: segment 1's start */
+    uint64_t lap = (uint64_t)WAL_RING_FRAMES * 4096;   /* one ring lap, 8 MB */
     WalByteInsert p;
 
     wal_insert_plan(&wm, &p, lap + 24, buf, 100, 0);
-    CHECK(p.frame == 0 && p.ctr_idx[0] == 0, "LSN 4 MB + 24 plans frame 0, counter 0");
+    CHECK(p.frame == 0 && p.ctr_idx[0] == 0, "LSN 8 MB + 24 (one lap) plans frame 0, counter 0");
     wal_insert_copy(&wm, &p);
     WalPageHeader h;
     CHECK(wal_page_header_deserialize(wm.ring_buf, &h) == MYDB_OK && h.start_lsn == lap,
-          "its header says start_lsn 4 MB");
+          "its header says start_lsn 8 MB");
 
     /* A batch running off the ring's last frame continues in frame 0. */
     static uint8_t big[5000];
@@ -320,7 +326,7 @@ static void test_plan_wraps(void)
     wal_insert_plan(&wm, &p, lap - 4096 + 24, big, 5000, 0);
     CHECK(p.frame == WAL_RING_FRAMES - 1, "starts in the last frame");
     CHECK(plan_next(&wm, &p, big, 5000) && p.frame == 0 && p.lsn == lap + 24 && p.ctr_idx[0] == 0,
-          "continues in frame 0 at LSN 4 MB + 24");
+          "continues in frame 0 at LSN 8 MB + 24");
     ring_free(&wm);
 }
 
@@ -453,8 +459,8 @@ static void test_fill_headers(void)
     CHECK(record_is(buf, 100, 100, 24, 0, 0x80), "a stale CONTINUES flag is cleared, the other bits kept");
 
     make_records(buf + 1, (uint32_t[]){333}, 1);
-    last = wal_insert_fill_headers(buf + 1, 333, 1024ull * 4072, 24);
-    CHECK(record_is(buf + 1, 333, 100, (1ull << 22) + 24, 24, 0) && last == (1ull << 22) + 24,
+    last = wal_insert_fill_headers(buf + 1, 333, (uint64_t)WAL_SEG_PAGES * 4072, 24);
+    CHECK(record_is(buf + 1, 333, 100, (uint64_t)WAL_SEG_SIZE + 24, 24, 0) && last == (uint64_t)WAL_SEG_SIZE + 24,
           "segment 1's first byte, from a buffer at an odd address");
 }
 
@@ -549,7 +555,7 @@ static void test_reserve(void)
           atomic_load(&wm.current_pos) == high + 3000000000ull,
           "positions past 4 GB and a 3 GB length are not truncated");
 
-    /* Far more than the 4 MB ring with nothing written (write_lsn 0). */
+    /* Far more than the 8 MB ring with nothing written (write_lsn 0). */
     atomic_store(&wm.current_pos, 0);
     CHECK(wal_insert_reserve(&wm, 64u << 20) == 0 && atomic_load(&wm.current_pos) == 64u << 20,
           "more than the whole ring still succeeds");
@@ -806,39 +812,15 @@ static void remove_wal_dir(void)
     rmdir(INSERT_WAL_DIR);
 }
 
-/* Stands in for the write step until wal_flush exists: everything up to
- * end must be complete in the counters (the tail block up to end); writes
- * those pages, moving to the next segment as it gets there, and zeroes
- * the counters of the blocks it passed. */
+/* Writes and syncs everything up to end (wal_log_flush). */
 static bool write_out(WalManager *wm, uint64_t end)
 {
-    uint64_t from = atomic_load(&wm->write_lsn);
-
-    for (uint64_t b = from & ~(uint64_t)(WAL_BLOCK_SIZE - 1); b < end; b += WAL_BLOCK_SIZE) {
-        _Atomic uint16_t *c = wal_block_counter(wm->fs_counters, wm->ctr_mask, b);
-        bool     whole = b + WAL_BLOCK_SIZE <= end;
-        uint64_t want  = whole ? WAL_BLOCK_SIZE : end - b;
-        if (atomic_load(c) != want) return false;
-        if (whole) atomic_store(c, 0);
-    }
-
-    for (uint64_t pg = from & ~(uint64_t)(WAL_PAGE_SIZE - 1); pg < end; pg += WAL_PAGE_SIZE) {
-        uint64_t seg = wm->pool.slots[wm->curr_slot].header.segment_no;
-        if (wal_lsn_segment(pg) > seg) {
-            if (wal_segment_pool_mark_done(&wm->pool, NULL, wm->curr_slot, (seg + 1) << WAL_SEG_SHIFT,
-                                           WAL_SEG_PAGES, NULL) != MYDB_OK) return false;
-            if (wal_segment_pool_claim_next(&wm->pool, &wm->curr_slot) != MYDB_OK) return false;
-        }
-        uint8_t *frame = wm->ring_buf + ((pg >> WAL_PAGE_SHIFT) & wm->ring_frame_mask) * WAL_PAGE_SIZE;
-        if (wal_segment_pool_write_page(&wm->pool, wm->curr_slot, wal_lsn_page(pg) + 1, frame) != MYDB_OK)
-            return false;
-    }
-    atomic_store(&wm->write_lsn, end);
-    return true;
+    return wal_log_flush(wm, end) == MYDB_OK &&
+           atomic_load(&wm->write_lsn) >= end && atomic_load(&wm->flushed_lsn) >= end;
 }
 
-/* The writer against the reader: insert into a real WalManager, write
- * out, restart, and tail_scan must find exactly the end wal_insert
+/* The writer against the reader: insert into a real WalManager, commit
+ * (write and sync), restart, and tail_scan must find exactly the end wal_insert
  * returned, then inserting goes on from there. Runs past segment 0, once
  * ending exactly on its end and once with a record across it. */
 static void test_insert_restart(bool end_on_segment_end)
@@ -947,7 +929,7 @@ static void test_space_check_passes(void)
     printf("\n[test_space_check_passes]\n");
     WalManager wm;
     ring_setup(&wm);
-    const uint64_t R = (uint64_t)WAL_RING_FRAMES * WAL_PAGE_SIZE;   /* 4 MB */
+    const uint64_t R = (uint64_t)WAL_RING_FRAMES * WAL_PAGE_SIZE;   /* 8 MB */
     uint64_t wc = 0;
 
     atomic_store(&wm.write_lsn, 1000);
@@ -964,374 +946,99 @@ static void test_space_check_passes(void)
     ring_free(&wm);
 }
 
-typedef struct {
-    WalManager   *wm;
-    uint8_t      *buf;
-    uint32_t      len;
-    uint64_t      wc, last, end;
-    int           rc;
-    _Atomic bool  done;
-} InsertJob;
-
-static void *insert_job(void *arg)
-{
-    InsertJob *j = arg;
-    j->rc = wal_insert(j->wm, j->buf, j->len, 0, &j->wc, &j->last, &j->end);
-    atomic_store(&j->done, true);
-    return NULL;
-}
-
-static bool job_done_within(InsertJob *j, int ms)
-{
-    for (int i = 0; i < ms && !atomic_load(&j->done); i++) usleep(1000);
-    return atomic_load(&j->done);
-}
-
-static bool frame_is(const WalManager *wm, uint32_t frame, uint8_t byte)
-{
-    const uint8_t *f = wm->ring_buf + (size_t)frame * WAL_PAGE_SIZE;
-    for (uint32_t i = 0; i < WAL_PAGE_SIZE; i++) if (f[i] != byte) return false;
-    return true;
-}
-
-/* An insert that runs into lap 1's unwritten frame waits there, piece by
- * piece, until the write step (this test) has written and zeroed every
- * block its piece touches: not before, and not for the whole 2 KB line. */
-static void test_space_check_waits(void)
-{
-    printf("\n[test_space_check_waits]\n");
-    WalManager wm;
-    ring_setup(&wm);
-    const uint64_t R = (uint64_t)WAL_RING_FRAMES * WAL_PAGE_SIZE;
-
-    /* Lap 1 left frame 0 full and not written: blocks 0 and 1 read 512. */
-    memset(wm.ring_buf, 0xEE, WAL_PAGE_SIZE);
-    atomic_store(&wm.fs_counters[0].done, 512);
-    atomic_store(&wm.fs_counters[1].done, 512);
-
-    /* One 4972-byte record from page 1023's first record byte: piece 1
-     * fills page 1023 (ends at R, free), piece 2 is 900 bytes on page 1024,
-     * frame 0 again, LSN [R + 24, R + 924): need = R + 1024. */
-    static uint8_t buf[5000];
-    make_records(buf, (uint32_t[]){4972}, 1);
-    atomic_store(&wm.current_pos, 1023ull * WAL_PAGE_USABLE);
-
-    InsertJob j = { .wm = &wm, .buf = buf, .len = 4972 };
-    pthread_t th;
-    if (pthread_create(&th, NULL, insert_job, &j) != 0) {
-        CHECK(0, "start the inserting thread");
-        ring_free(&wm);
-        return;
-    }
-
-    bool last_page_full = true;
-    CHECK(!job_done_within(&j, 100) && frame_is(&wm, 0, 0xEE) &&
-          ctr(&wm, 0) == 512 && ctr(&wm, 1) == 512,
-          "write_lsn 0: it waits before frame 0, which keeps lap 1's bytes and counters");
-    for (uint32_t b = 1023 * 8; b < 1024 * 8; b++) if (ctr(&wm, b) != 512) last_page_full = false;
-    CHECK(last_page_full, "while the first piece is already copied: page 1023's blocks all read 512");
-
-    /* The write step passes block 0: zeroes it, then publishes. */
-    atomic_store(&wm.fs_counters[0].done, 0);
-    atomic_store(&wm.write_lsn, 512);
-    CHECK(!job_done_within(&j, 100) && frame_is(&wm, 0, 0xEE),
-          "write_lsn 512: still waits, its piece also touches block 1");
-
-    /* It stops inside block 1, past the piece's own end (924) but in its
-     * tail block, which it does not zero. */
-    atomic_store(&wm.write_lsn, 930);
-    CHECK(!job_done_within(&j, 100) && frame_is(&wm, 0, 0xEE) && ctr(&wm, 1) == 512,
-          "write_lsn 930: still waits, for block 1's end (1024), not the piece's end (924)");
-
-    atomic_store(&wm.fs_counters[1].done, 0);
-    atomic_store(&wm.write_lsn, 1024);
-    bool woke = job_done_within(&j, 5000);
-    CHECK(woke, "write_lsn 1024: block 1 written and zeroed, the insert goes on");
-    if (!woke) atomic_store(&wm.write_lsn, UINT64_MAX / 2);   /* let it finish, to join */
-    pthread_join(th, NULL);
-
-    WalPageHeader h;
-    CHECK(j.rc == MYDB_OK && j.last == R - WAL_PAGE_SIZE + 24 && j.end == R + 924 && j.wc == 1024,
-          "it returns its LSNs, and the session's copy is the write_lsn it waited for");
-    CHECK(wal_page_header_deserialize(wm.ring_buf, &h) == MYDB_OK && h.start_lsn == R &&
-          h.continuation_len == 900 && h.flags == WAL_PAGE_INCOMING_CONTINUATION &&
-          memcmp(wm.ring_buf + 24, buf + 4072, 900) == 0,
-          "frame 0 now holds page 1024: its header and the record's last 900 bytes");
-    CHECK(ctr(&wm, 0) == 512 && ctr(&wm, 1) == 412,
-          "counted from zero: block 0 = 24 + 488 = 512, block 1 = 924 - 512 = 412");
-    ring_free(&wm);
-}
-
 /* ------------------------------------------------------------------
- * Concurrent inserts: sessions insert at once while a stand-in write step
- * drains the ring by the block rule, about two rings of log in all, and
- * the "disk" it wrote must be the one unbroken log the sessions meant.
+ * The completeness scan (wal_flush_scan, V2 §10.5). Counters are set by
+ * hand, no copiers: each case is a state the counters can be in.
  * ------------------------------------------------------------------ */
-#define CI_SESSIONS        8
-#define CI_BYTES_PER_SESS  (1u << 20)          /* 8 sessions: ~8 MB, two rings */
-#define CI_MAX_REC         (44 + 12000)
-#define CI_MAX_RECS        8000
-#define CI_DISK_SIZE       (12u << 20)
 
-typedef struct {
-    WalManager   *wm;
-    uint32_t      sid;
-    uint64_t     *lsns;       /* record i's LSN, from its filled header */
-    uint32_t     *lens;
-    uint32_t      n_rec;
-    uint64_t      max_end;
-    bool          ok;
-    _Atomic int  *finished;
-} CiSession;
-
-/* Record seq of session sid, as a caller hands it over: page_no = seq and
- * table_id = sid say whose it is, the body is a pattern of both. */
-static void ci_record(uint8_t *rec, uint32_t len, uint32_t sid, uint32_t seq)
+/* Zeroed counters, the scan to start at write_lsn, current_pos = pos. */
+static void scan_reset(WalManager *wm, uint64_t write_lsn, uint64_t pos)
 {
-    uint32_t body_len = len - WAL_RECORD_HEADER_SIZE;
-    uint8_t *body = rec + WAL_RECORD_HEADER_SIZE;
-    for (uint32_t j = 0; j < body_len; j++) body[j] = (uint8_t)(j * 13 + seq * 7 + sid);
-
-    WalRecordHeader h = {0};
-    h.lsn       = UINT64_MAX;
-    h.prev_lsn  = UINT64_MAX;
-    h.txn_id    = sid + 1;
-    h.total_len = len;
-    h.table_id  = sid;
-    h.page_no   = seq;
-    h.rec_type  = WAL_REC_INSERT;
-    h.checksum  = body_len ? crc32c_update(CRC32C_INIT, body, body_len) : CRC32C_INIT;
-    memcpy(rec, &h, WAL_RECORD_HEADER_SIZE);
+    memset(wm->fs_counters, 0, (size_t)(wm->ctr_mask + 1) * sizeof(WalBlockCounter));
+    atomic_store(&wm->write_lsn, write_lsn);
+    wm->last_ctr_idx = (uint32_t)((write_lsn >> WAL_BLOCK_SHIFT) & wm->ctr_mask);
+    atomic_store(&wm->current_pos, pos);
 }
 
-/* One session: batches of 1-3 records, mostly small, every 17th up to
- * 12 KB (across pages), until it has inserted CI_BYTES_PER_SESS. */
-static void *ci_session(void *arg)
+static void set_ctr(WalManager *wm, uint32_t i, uint16_t v) { atomic_store(&wm->fs_counters[i].done, v); }
+
+static void test_scan(void)
 {
-    CiSession *s   = arg;
-    uint8_t   *buf = malloc(3 * CI_MAX_REC);
-    uint64_t   prev = 0, wc = 0, total = 0;   /* the session's prev_lsn and write_lsn copy */
-    s->ok = (buf != NULL);
-
-    for (uint32_t k = 0; s->ok && total < CI_BYTES_PER_SESS; k++) {
-        if (s->n_rec + 3 > CI_MAX_RECS) { s->ok = false; break; }
-        uint32_t n = 1 + k % 3, off = 0, first = s->n_rec;
-        for (uint32_t i = 0; i < n; i++) {
-            uint32_t r   = s->sid * 7919u + s->n_rec * 131u;
-            uint32_t len = (s->n_rec % 17 == 5) ? 44 + r % 12000 : 44 + r % 700;
-            ci_record(buf + off, len, s->sid, s->n_rec);
-            s->lens[s->n_rec++] = len;
-            off += len;
-        }
-
-        uint64_t last, end;
-        if (wal_insert(s->wm, buf, off, prev, &wc, &last, &end) != MYDB_OK) { s->ok = false; break; }
-        off = 0;
-        for (uint32_t i = first; i < s->n_rec; i++) {
-            WalRecordHeader h;
-            memcpy(&h, buf + off, WAL_RECORD_HEADER_SIZE);
-            s->lsns[i] = h.lsn;
-            off += s->lens[i];
-        }
-        if (last != s->lsns[s->n_rec - 1] || end != wal_lsn_advance(last, s->lens[s->n_rec - 1]))
-            s->ok = false;
-        if (end > s->max_end) s->max_end = end;
-        prev   = last;
-        total += off;
-    }
-    free(buf);
-    atomic_fetch_add(s->finished, 1);
-    return NULL;
-}
-
-typedef struct {
-    WalManager   *wm;
-    uint8_t      *disk;       /* the "segment files": byte lsn at disk[lsn] */
-    uint64_t      max_lag;    /* most the reservations got ahead of write_lsn */
-    bool          ok;
-    _Atomic bool  stop;
-} CiWriter;
-
-/* Stands in for the write step, by the block rule: a block that reads 512
- * is copied to disk, zeroed, and only then is write_lsn published past it
- * (release). It never zeroes the tail block, and stops at it once told
- * to. Slowed on purpose so the inserts fill the ring and wait. */
-static void *ci_writer(void *arg)
-{
-    CiWriter   *w   = arg;
-    WalManager *wm  = w->wm;
-    uint64_t    R   = (uint64_t)wm->ring_buf_size << WAL_PAGE_SHIFT;
-    uint64_t    pos = atomic_load(&wm->write_lsn);
-    uint32_t    n   = 0;
-    w->ok = true;
-
-    for (;;) {
-        _Atomic uint16_t *c = wal_block_counter(wm->fs_counters, wm->ctr_mask, pos);
-        if (atomic_load_explicit(c, memory_order_acquire) == WAL_BLOCK_SIZE) {
-            if (pos + WAL_BLOCK_SIZE > CI_DISK_SIZE) { w->ok = false; break; }
-            memcpy(w->disk + pos, wm->ring_buf + (pos & (R - 1)), WAL_BLOCK_SIZE);
-            atomic_store_explicit(c, 0, memory_order_relaxed);
-            pos += WAL_BLOCK_SIZE;
-            atomic_store_explicit(&wm->write_lsn, pos, memory_order_release);
-
-            uint64_t reserved = wal_byte_to_lsn(atomic_load(&wm->current_pos));
-            if (reserved > pos && reserved - pos > w->max_lag) w->max_lag = reserved - pos;
-            if (++n % 8 == 0) usleep(200);
-            continue;
-        }
-        if (atomic_load(&w->stop)) break;
-        sched_yield();
-    }
-    return NULL;
-}
-
-/* Copies n record bytes from the disk image starting at lsn, hopping
- * page headers; returns the LSN just past them. */
-static uint64_t disk_read(const uint8_t *disk, uint64_t lsn, uint8_t *dst, uint32_t n)
-{
-    while (n) {
-        if (wal_lsn_offset(lsn) == 0) lsn += WAL_PAGE_HEADER_SIZE;
-        uint32_t take = WAL_PAGE_SIZE - wal_lsn_offset(lsn);
-        if (take > n) take = n;
-        memcpy(dst, disk + lsn, take);
-        dst += take;
-        n   -= take;
-        lsn += take;
-    }
-    return lsn;
-}
-
-static void test_insert_concurrent(void)
-{
-    printf("\n[test_insert_concurrent]\n");
+    printf("\n[test_scan]\n");
     WalManager wm;
     ring_setup(&wm);
-    const uint64_t R = (uint64_t)WAL_RING_FRAMES * WAL_PAGE_SIZE;
+    WalScanResult r;
+    const uint64_t ring_bytes = (uint64_t)WAL_RING_FRAMES * WAL_PAGE_SIZE;
 
-    _Atomic int finished = 0;
-    CiSession   s[CI_SESSIONS];
-    CiWriter    w = { .wm = &wm, .disk = calloc(1, CI_DISK_SIZE) };
-    uint8_t    *rec = malloc(CI_MAX_REC);
-    bool        mem = w.disk && rec;
-    for (uint32_t i = 0; i < CI_SESSIONS; i++) {
-        s[i] = (CiSession){ .wm = &wm, .sid = i, .finished = &finished,
-                            .lsns = malloc(CI_MAX_RECS * sizeof(uint64_t)),
-                            .lens = malloc(CI_MAX_RECS * sizeof(uint32_t)) };
-        if (!s[i].lsns || !s[i].lens) mem = false;
-    }
+    /* V2 §10.6: H [0,100), A [100,700), B [700,760) in data bytes, so
+     * LSN 24..124, 124..724, 724..784; current_pos 760 -> LSN 784. */
+    scan_reset(&wm, 0, 760);
+    set_ctr(&wm, 0, 124);                                  /* only H */
+    wal_flush_scan(&wm, &r);
+    CHECK(r.end_lsn == 0 && r.full_blocks == 0 && !r.tail,
+          "worked example, H only: block 0 = 124 of 512 reserved, a hole: nothing to write");
+    set_ctr(&wm, 0, 512); set_ctr(&wm, 1, 212);            /* A publishes */
+    wal_flush_scan(&wm, &r);
+    CHECK(r.end_lsn == 512 && r.full_blocks == 1 && !r.tail,
+          "worked example, H and A: block 0 full, block 1 = 212 of 272 reserved, B is a hole: stop at 512");
+    set_ctr(&wm, 1, 272);                                  /* B publishes */
+    wal_flush_scan(&wm, &r);
+    CHECK(r.end_lsn == 784 && r.full_blocks == 1 && r.tail,
+          "worked example, all three: block 1 = 272 = reserved, a complete tail: up to 784");
 
-    pthread_t wth, th[CI_SESSIONS];
-    uint32_t  started = 0;
-    bool      writer_up = mem && pthread_create(&wth, NULL, ci_writer, &w) == 0;
-    if (writer_up)
-        for (; started < CI_SESSIONS; started++)
-            if (pthread_create(&th[started], NULL, ci_session, &s[started]) != 0) break;
-    CHECK(writer_up && started == CI_SESSIONS, "memory, the writer and 8 session threads");
-    if (!writer_up || started < CI_SESSIONS) {
-        /* Nothing is checked without all of them; let what started end. */
-        atomic_store(&wm.write_lsn, UINT64_MAX / 2);
-        for (uint32_t i = 0; i < started; i++) pthread_join(th[i], NULL);
-        if (writer_up) { atomic_store(&w.stop, true); pthread_join(wth, NULL); }
-        goto out;
-    }
+    /* A whole frame full, then a tail in the next frame's block 0, whose
+     * 124 bytes are its page header + 100 data bytes. */
+    scan_reset(&wm, 0, WAL_PAGE_USABLE + 100);             /* LSN 4096 + 24 + 100 */
+    for (uint32_t i = 0; i < 8; i++) set_ctr(&wm, i, 512);
+    set_ctr(&wm, 8, 124);
+    wal_flush_scan(&wm, &r);
+    CHECK(r.end_lsn == 4220 && r.full_blocks == 8 && r.tail,
+          "8 full blocks, then a tail of page header + 100 bytes: up to 4220");
 
-    /* A session stuck in the space wait would hang the test: give up
-     * loudly after 60 s instead. */
-    for (int i = 0; i < 60000 && atomic_load(&finished) < CI_SESSIONS; i++) usleep(1000);
-    if (atomic_load(&finished) < CI_SESSIONS) {
-        CHECK(0, "every session finished within 60 s (none stuck waiting for space)");
-        printf("\nResults: %d/%d passed\n", tests_passed, tests_run);
-        exit(1);
-    }
-    for (uint32_t i = 0; i < CI_SESSIONS; i++) pthread_join(th[i], NULL);
-    atomic_store(&w.stop, true);
-    pthread_join(wth, NULL);
+    /* current_pos exactly at a page start: its LSN is 4120, but no copier
+     * has written that page's header yet. */
+    scan_reset(&wm, 0, WAL_PAGE_USABLE);
+    for (uint32_t i = 0; i < 8; i++) set_ctr(&wm, i, 512);
+    wal_flush_scan(&wm, &r);
+    CHECK(r.end_lsn == 4096 && r.full_blocks == 8 && !r.tail,
+          "current_pos at a page start: the next page's header is not written, stop at the page start 4096");
 
-    bool     calls_ok = w.ok;
-    uint64_t max_end  = 0;
-    for (uint32_t i = 0; i < CI_SESSIONS; i++) {
-        if (!s[i].ok) calls_ok = false;
-        if (s[i].max_end > max_end) max_end = s[i].max_end;
-    }
-    uint64_t end_lsn = wal_lsn_advance(WAL_FIRST_RECORD_LSN, atomic_load(&wm.current_pos));
-    CHECK(calls_ok && max_end == end_lsn,
-          "every call OK, its LSNs match its filled headers, and the latest end is the log's end");
-    CHECK(end_lsn > 2 * R, "more than two rings of log went through the ring");
-    CHECK(w.max_lag > R,
-          "the ring filled: reservations ran more than a ring ahead of write_lsn, so inserts waited");
+    /* A tail block with a hole in it. */
+    scan_reset(&wm, 0, 688);                               /* LSN 712: 200 bytes into block 1 */
+    set_ctr(&wm, 0, 512); set_ctr(&wm, 1, 100);
+    wal_flush_scan(&wm, &r);
+    CHECK(r.end_lsn == 512 && r.full_blocks == 1 && !r.tail,
+          "tail block with 100 of 200 reserved bytes counted: a hole, stop at its start 512");
 
-    /* The tail: the write step stops in the last block; take it as it is. */
-    uint64_t wl      = atomic_load(&wm.write_lsn);
-    bool     tail_ok = wl <= end_lsn && end_lsn - wl < WAL_BLOCK_SIZE;
-    if (tail_ok && end_lsn > wl) {
-        tail_ok = ctr(&wm, (uint32_t)((wl >> WAL_BLOCK_SHIFT) & wm.ctr_mask)) == end_lsn - wl;
-        memcpy(w.disk + wl, wm.ring_buf + (wl & (R - 1)), end_lsn - wl);
-    }
-    CHECK(tail_ok, "the write step stops only in the tail block, which holds exactly the last bytes");
-    bool zeroed = true;
-    for (uint32_t i = 0; i <= wm.ctr_mask; i++)
-        if (i != ((wl >> WAL_BLOCK_SHIFT) & wm.ctr_mask) && ctr(&wm, i) != 0) zeroed = false;
-    CHECK(zeroed, "every other counter is back to zero");
+    /* Starting mid-block: write_lsn 124, the last write step stopped in
+     * block 0, whose counter still holds those 124 bytes. */
+    scan_reset(&wm, 124, 300);                             /* LSN 324 */
+    set_ctr(&wm, 0, 324);
+    wal_flush_scan(&wm, &r);
+    CHECK(r.end_lsn == 324 && r.full_blocks == 0 && r.tail,
+          "start mid-block: counter 324 = everything reserved from the block's start, up to 324");
+    set_ctr(&wm, 0, 200);
+    wal_flush_scan(&wm, &r);
+    CHECK(r.end_lsn == 124 && !r.tail,
+          "start mid-block with a hole: end stays at write_lsn 124, never below it");
 
-    /* Walk the disk from LSN 24 by total_len, as recovery would. */
-    uint32_t  pages    = (uint32_t)((end_lsn + WAL_PAGE_SIZE - 1) >> WAL_PAGE_SHIFT);
-    uint16_t *exp_cont = calloc(pages, sizeof(uint16_t));
-    uint32_t  next_seq[CI_SESSIONS] = {0};
-    bool      walk_ok = exp_cont != NULL, owner_ok = true, body_ok = true;
-    uint64_t  lsn = WAL_FIRST_RECORD_LSN;
-    while (walk_ok && lsn < end_lsn) {
-        if (wal_lsn_offset(lsn) == 0) lsn += WAL_PAGE_HEADER_SIZE;
-        uint32_t total_len;
-        disk_read(w.disk, lsn, rec, WAL_RECORD_HEADER_SIZE);
-        memcpy(&total_len, rec + offsetof(WalRecordHeader, total_len), 4);
-        if (total_len < WAL_RECORD_HEADER_SIZE || total_len > CI_MAX_REC) { walk_ok = false; break; }
-        uint64_t next = disk_read(w.disk, lsn, rec, total_len);
+    /* Wrapping at the ring's end: the last block, then counter 0 for the
+     * next pass's first frame (page header + 76 bytes). */
+    scan_reset(&wm, ring_bytes - 512, wal_lsn_to_byte(ring_bytes + 100));
+    CHECK(wm.last_ctr_idx == wm.ctr_mask, "the scan starts at the last counter, 16383");
+    set_ctr(&wm, wm.ctr_mask, 512);
+    set_ctr(&wm, 0, 100);
+    wal_flush_scan(&wm, &r);
+    CHECK(r.end_lsn == ring_bytes + 100 && r.full_blocks == 1 && r.tail,
+          "the scan wraps from counter 16383 to counter 0: up to ring end + 100");
 
-        WalRecordHeader h;
-        if (wal_record_header_deserialize(rec, total_len - WAL_RECORD_HEADER_SIZE, &h) != MYDB_OK) {
-            walk_ok = false;
-            break;
-        }
-        uint32_t sid = h.table_id, seq = h.page_no;
-        if (sid >= CI_SESSIONS || seq != next_seq[sid] || seq >= s[sid].n_rec ||
-            h.lsn != lsn || s[sid].lsns[seq] != lsn || s[sid].lens[seq] != total_len ||
-            h.prev_lsn != (seq ? s[sid].lsns[seq - 1] : 0)) {
-            owner_ok = false;
-        } else {
-            next_seq[sid]++;
-            for (uint32_t j = 0; j < total_len - WAL_RECORD_HEADER_SIZE; j++)
-                if (rec[WAL_RECORD_HEADER_SIZE + j] != (uint8_t)(j * 13 + seq * 7 + sid)) body_ok = false;
-        }
+    /* A completely full ring: every counter 512. */
+    scan_reset(&wm, 0, (uint64_t)WAL_RING_FRAMES * WAL_PAGE_USABLE);   /* LSN ring end + 24 */
+    for (uint32_t i = 0; i <= wm.ctr_mask; i++) set_ctr(&wm, i, 512);
+    wal_flush_scan(&wm, &r);
+    CHECK(r.end_lsn == ring_bytes && r.full_blocks == wm.ctr_mask + 1 && !r.tail,
+          "a full ring: the scan stops after one ring, 16384 blocks, at 8 MB");
 
-        /* Each page that starts inside this record continues it. */
-        for (uint64_t pb = (lsn & ~(uint64_t)(WAL_PAGE_SIZE - 1)) + WAL_PAGE_SIZE; pb < next; pb += WAL_PAGE_SIZE) {
-            uint64_t before = wal_lsn_to_byte(pb + WAL_PAGE_HEADER_SIZE) - wal_lsn_to_byte(lsn);
-            uint64_t rest   = total_len - before;
-            exp_cont[pb >> WAL_PAGE_SHIFT] = (uint16_t)(rest < WAL_PAGE_USABLE ? rest : WAL_PAGE_USABLE);
-        }
-        lsn = next;
-    }
-    for (uint32_t i = 0; i < CI_SESSIONS; i++) if (next_seq[i] != s[i].n_rec) owner_ok = false;
-    CHECK(walk_ok && lsn == end_lsn,
-          "the disk is one unbroken log from LSN 24 to the end: every record found by total_len, every CRC valid");
-    CHECK(owner_ok, "each session's records are all there, once, in its order, at the LSNs it was given, prev_lsn chained");
-    CHECK(body_ok, "every record's body is the bytes its session wrote");
-
-    bool pages_ok = walk_ok;
-    for (uint32_t p = 0; pages_ok && p < pages; p++) {
-        WalPageHeader ph;
-        if (wal_page_header_deserialize(w.disk + (uint64_t)p * WAL_PAGE_SIZE, &ph) != MYDB_OK ||
-            ph.start_lsn != (uint64_t)p * WAL_PAGE_SIZE || ph.continuation_len != exp_cont[p] ||
-            ph.flags != (exp_cont[p] ? WAL_PAGE_INCOMING_CONTINUATION : 0))
-            pages_ok = false;
-    }
-    CHECK(pages_ok, "every page header: start_lsn, continuation_len and flag");
-    free(exp_cont);
-
-out:
-    for (uint32_t i = 0; i < CI_SESSIONS; i++) { free(s[i].lsns); free(s[i].lens); }
-    free(rec);
-    free(w.disk);
     ring_free(&wm);
 }
 
@@ -1356,8 +1063,7 @@ int main(void)
     test_insert_restart(true);
     test_insert_restart(false);
     test_space_check_passes();
-    test_space_check_waits();
-    test_insert_concurrent();
+    test_scan();
 
     printf("\nResults: %d/%d passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
